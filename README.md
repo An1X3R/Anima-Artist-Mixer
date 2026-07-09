@@ -1,122 +1,182 @@
 # Anima-Artist-Mixer
 
-A ComfyUI custom node that enables **multi-artist mixing** for the Anima model by hooking into its cross-attention layers.
+A ComfyUI custom node for **multi-artist mixing** on Anima models. It encodes each artist separately and mixes the resulting conditionings inside Anima's cross-attention layers, avoiding the prompt-side artist interference caused by Anima's LLM text encoder.
 
-![surtr](docs/images/ComfyUI_01092_.png)
-## What it does
+## What It Does
 
-Anima uses an LLM as its text encoder. When multiple artist tags are stacked in a single prompt, the LLM's contextualization causes them to interfere with each other, producing a conditioning that resembles neither artist clearly. This node encodes each artist independently and mixes them at the model's cross-attention layer, sidestepping the interference at the prompt-encoding stage.
+Anima uses an LLM-based text encoder. When several artist tags are placed in one prompt, the encoder contextualizes them together and the styles can blur or interfere. This plugin instead:
 
-The bundled `AnimaArtistPack` node provides a one-shot experience: write your artist list (separated by commas or newlines) in one text box, your main prompt in another, and the node handles splitting, encoding, and packaging automatically.
+1. Splits the artist chain into individual artists.
+2. Encodes each artist with the same base prompt.
+3. Patches Anima cross-attention on a cloned model.
+4. Mixes the artist outputs with selectable strategies.
 
-The current release (v24) adds layered cross-seed stabilizers, CFG-style strength extrapolation, and a new linear injection-layer weight syntax `::name::weight`.
+The normal workflow still uses three main nodes:
 
-## Quick links
+- `Anima Artist Pack (Split + Encode)`
+- `Anima Artist Cross-Attn (v26 fixed)`
+- `Anima Artist Options (Advanced)`
 
-- [Full documentation](docs/USAGE.md) — usage, parameters, modes, stabilizers, performance tips
-- [Issues](../../issues) — bug reports, feature requests
-- [Discussions](../../discussions) — usage questions, results sharing
+There is also an optional `Anima Artist Structure Guard` node for object/composition stability experiments.
 
 ## Installation
 
-Clone or download into your ComfyUI `custom_nodes` directory:
+Clone or download this repository into your ComfyUI `custom_nodes` directory:
 
-```
-ComfyUI/custom_nodes/<this-plugin-folder>/
+```text
+ComfyUI/custom_nodes/Anima-Artist-Mixer/
 ```
 
-Restart ComfyUI. No extra dependencies.
+Restart ComfyUI. No extra Python dependencies are required.
 
 ## Requirements
 
-- **Anima model only** — depends on Anima's built-in `LLMAdapter` (`preprocess_text_embeds`)
-- Use the **same CLIP loader** that Anima's own text-encoding workflow uses (the one whose tokens carry `t5xxl_ids`)
-- Inference only
+- Anima model only.
+- Use the same CLIP/text loader that Anima's normal workflow uses.
+- Inference only.
 
-## Quick start
-![workflow](docs/images/workflow.png)
+The plugin checks for Anima's `preprocess_text_embeds` path and will reject unsupported model structures.
 
-```
-                          ┌──► artist_pack ──► AnimaArtistCrossAttn ──► MODEL ──► KSampler
-[Load CLIP] ─► CLIP ──────┤                              │                          │
-                          │                              └──► base_prompt ──► (positive)
-                          │
-                          └──► CLIPTextEncode (Negative) ──► (negative)
+## Quick Start
 
-[Load Anima Model] ──► MODEL ──► AnimaArtistCrossAttn
+1. Connect your CLIP loader to `Anima Artist Pack`.
+2. Put artists in the top artist-chain text box, separated by commas or newlines.
+3. Put your main positive prompt in the base prompt text box.
+4. Connect `artist_pack` to `Anima Artist Cross-Attn`.
+5. Connect your Anima model to `Anima Artist Cross-Attn`.
+6. Send the patched model to KSampler.
+7. Send the `base_prompt` output to KSampler positive conditioning.
 
-(optional) AnimaArtistOptions ──► advanced_options ──► AnimaArtistCrossAttn
-```
+Recommended starting point:
 
-- Top text box of `AnimaArtistPack`: your artist chain (comma or newline separated)
-- Bottom text box: the main prompt (no need to repeat artist names here)
-- Wire `AnimaArtistCrossAttn`'s `base_prompt` output directly to KSampler's positive input
-
-For full parameter explanations and recommended combinations, see [docs/USAGE.md](docs/USAGE.md).
-
-## Recommended defaults
-
-```
+```text
 combine_mode = output_avg
 fusion_mode  = interpolate
 strength     = 1.0
+normalize_weights = true
 ```
 
-To weight individual artists within the chain, use either of two syntaxes (they can coexist and stack):
+For stronger style:
 
+```text
+fusion_mode = base_preserve
+strength    = 1.2 - 1.8
 ```
-wlop, ::sakimichan::1.2, (krenz:0.7)
+
+## Artist Weights
+
+Artist-chain entries can use normal prompt weights and injection-layer weights:
+
+```text
+wlop
+(krenz:0.8)
+1.2::sakimichan
+sakimichan::1.2
 ```
 
-- `(name:1.2)` — CLIP-side weighting (same as SD/A1111), non-linear, applied at text encoding
-- `::name::1.2` — injection-side weighting (v24), linear and predictable, applied at cross-attention output
+Notes:
 
-## Cross-seed stability
+- `(artist:1.2)` is applied before CLIP/text encoding.
+- `1.2::artist` and `artist::1.2` are linear artist-mixing weights.
+- When `normalize_weights` is enabled, explicit `::weight` values are treated as relative ratios.
+- When `normalize_weights` is disabled, weights act as direct multipliers.
 
-In multi-artist setups, the same prompt with different seeds tends to produce noticeably different style mixes — sometimes one artist dominates, other times another, even at equal weights. This is structural to how cross-attention interacts with seed-driven hidden state.
+Example:
 
-v24 provides four optional stabilizers via `AnimaArtistOptions`, ordered from light to heavy:
+```text
+1::wlop, 2::sakimichan
+```
 
-| Stabilizer | Strength | Notes |
-|---|---|---|
-| `artist_ema_alpha` | light | Temporal EMA across sampling steps |
-| `combine_mode = lowrank_avg` + `lowrank_k` | medium | SVD low-rank constraint on multi-artist deltas |
-| `artist_static_capture` + `static_capture_k` | heavy | Freeze artist attention after K warmup steps (also a 30-50% speedup) |
-| `artist_anchor_q` | heaviest | Replace user-seed Q with a fixed-seed anchor's Q (near-full cross-seed decoupling) |
+With `normalize_weights=true`, this becomes a 1:2 relative mix, not a 3x amplification.
 
-All are off by default. Recommended progression: start with EMA, escalate as needed. See [docs/USAGE.md](docs/USAGE.md) for detailed mechanics and tuning.
+## Cross-Attention Node
 
-## Style amplification
+### combine_mode
 
-`strength` accepts values in `[0, 4]`:
+- `output_avg`: runs each artist separately and averages outputs. Usually the best default.
+- `concat`: concatenates artist conditionings before attention. Faster for many artists, but often less controlled.
+- `lowrank_avg`: stabilized averaging that constrains multi-artist deltas using a low-rank projection.
 
-- `0 ~ 1` — interpolation between base and artist (`strength=1` = pure artist replacement)
-- `1 ~ 4` — CFG-style extrapolation: `out = base + strength * (artist - base)`, amplifying the artist's deviation from base for stronger style
+### fusion_mode
 
-`1.5 ~ 2.5` is a common range for "stronger style without breaking content"; pushing past `3` tends to oversaturate.
+- `interpolate`: blends base and artist outputs directly.
+- `base_preserve`: removes the artist delta component that points along the base output direction, usually preserving subject/composition better.
+- `concat_with_base`: experimental and currently not the recommended path.
 
-## Performance notes
+### strength
 
-Generation time scales with artist count. Per the math of `output_avg`, each layer runs `N + 1` cross-attention forwards (N artists + base). Approximate measured cost (varies by GPU):
+- `0.0`: pure base.
+- `1.0`: normal artist mix.
+- `>1.0`: extrapolates style strength. Useful, but can damage structure if pushed too high.
 
-| Configuration | Relative time |
-|---|---|
-| 1 artist | 1.0x |
-| 4 artists | ~1.4x |
-| 8 artists | ~1.7x |
-| 5 artists + `artist_static_capture` (K=6) | ~1.1x |
-| 5 artists + `artist_anchor_q` (cached) | ~1.05x |
+## Advanced Options
 
-**Strongly recommended**: connect `AnimaArtistOptions` and limit either the layer range (`start_block / end_block`) or the sampling-step range (`start_percent / end_percent`). Both can dramatically reduce generation time with minimal quality loss, and stack with the cache-based stabilizers above. See the docs for details.
+`Anima Artist Options (Advanced)` exposes:
 
-## Important caveat
+- block range: `start_block`, `end_block`
+- sampling range: `start_percent`, `end_percent`
+- `normalize_weights`
+- `artist_ema_alpha`
+- `lowrank_k`
+- `artist_static_capture`
+- `static_capture_k`
+- `artist_anchor_q`
+- `anchor_seeds_count`
+- `anchor_user_blend`
+- `anchor_deep_layer_threshold`
+- `stabilizer_end_percent`
+- optional `layer_filter`
 
-This node **cannot achieve the near-lossless artist mixing that SDXL does**. Anima's text encoder is non-linear, so any mixing strategy introduces some distortion. What this node does is make that distortion controllable. Style-similar artists mix well; style-divergent artists may "regress to the mean" into a compromise look — `lowrank_avg` accepts more of this regression in exchange for cross-seed stability.
+The advanced node intentionally keeps its original widget order for workflow compatibility. New experimental controls are placed in separate helper nodes.
 
-## Acknowledgements
+## Structure Guard
 
-Special thanks to **汐浮尘/utowo** for co-development, testing, and design contributions. The `AnimaArtistPack` split-and-encode design comes from their improvement.
+`Anima Artist Structure Guard` is optional. Connect it like this:
+
+```text
+Anima Artist Options (Advanced) -> Anima Artist Structure Guard -> Anima Artist Cross-Attn
+```
+
+It adds two controls:
+
+- `structure_preserve`: pushes `interpolate` deltas toward the safer `base_preserve` direction.
+- `delta_norm_cap`: limits the artist delta magnitude relative to the base attention output.
+
+Both default to `0.0`, which preserves the old behavior.
+
+Suggested tests:
+
+```text
+interpolate:
+structure_preserve = 0.25 - 0.50
+delta_norm_cap     = 1.25 - 1.75
+
+base_preserve:
+structure_preserve = 0.0
+delta_norm_cap     = 1.0 - 1.5
+```
+
+If an existing workflow suddenly produces bad structure after an update, recreate the `Anima Artist Options (Advanced)` node once so ComfyUI refreshes its widget mapping.
+
+## Recent Fixes
+
+This version includes structural and runtime fixes inspired by PR #4 while keeping the public node set conservative:
+
+- Split implementation into `anima_mixer/` modules.
+- Patch `cross_attn.forward` instead of replacing the whole module.
+- Preserve disabled-node behavior by returning the unpatched model.
+- Fix CFG cond/uncond row masking for batched sampling.
+- Make explicit `::weight` respect `normalize_weights` again.
+- Reset runtime caches between sampling runs.
+- Improve anchor/static/EMA cache keys.
+- Avoid zero-padding uncond rows in `concat_with_base`.
+- Reraise OOM and Comfy interrupt exceptions instead of silently disabling layers.
+- Add optional structure-guard controls without changing old advanced-option widget order.
+
+## Caveats
+
+This plugin cannot make Anima artist mixing as lossless as SDXL artist chains. Anima's LLM encoder and adapter are highly non-linear, so any cross-attention mixing can still affect composition or object structure. The goal is to make the tradeoff controllable and debuggable.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for the full text.
+MIT License.
