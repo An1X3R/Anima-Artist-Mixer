@@ -81,10 +81,17 @@ def maybe_run_anchor(state, user_x, user_timestep, c_dict, apply_model=None):
         sigma_key = round(float(user_timestep.flatten()[0].item()), 4)
     except Exception:
         sigma_key = None
+    manual_anchor_seeds = list(state.get("anchor_seed_list") or [])
+    if manual_anchor_seeds:
+        anchor_seeds = manual_anchor_seeds[:ANCHOR_SEEDS_MAX]
+    else:
+        seeds_count = max(1, min(int(state.get("anchor_seeds_count", 1)), ANCHOR_SEEDS_MAX))
+        anchor_seeds = ANCHOR_SEEDS_POOL[:seeds_count]
     new_key = (
         tuple(user_x.shape),
         context_fingerprint(original_context),
         sigma_key,
+        tuple(anchor_seeds),
     )
     if state.get("_anchor_cache_key") == new_key and state.get("_anchor_cache"):
         return
@@ -131,9 +138,8 @@ def maybe_run_anchor(state, user_x, user_timestep, c_dict, apply_model=None):
             else:
                 processed_ctx = ctx_for_anchor
 
-            seeds_count = max(1, min(int(state.get("anchor_seeds_count", 1)), ANCHOR_SEEDS_MAX))
             accumulator = {}
-            for seed in ANCHOR_SEEDS_POOL[:seeds_count]:
+            for seed in anchor_seeds:
                 gen = torch.Generator(device=user_x.device)
                 gen.manual_seed(seed)
                 anchor_x = torch.randn(
@@ -160,7 +166,7 @@ def maybe_run_anchor(state, user_x, user_timestep, c_dict, apply_model=None):
                     else:
                         accumulator[layer_idx] = accumulator[layer_idx] + hidden.to(torch.float32)
 
-            inv = 1.0 / max(1, seeds_count)
+            inv = 1.0 / max(1, len(anchor_seeds))
             state["_anchor_cache"] = {
                 idx: (acc * inv).to(user_x.dtype) for idx, acc in accumulator.items()
             }

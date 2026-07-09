@@ -3,10 +3,12 @@
 from .constants import (
     ANCHOR_LAYER_THRESHOLD_DISABLED,
     ANCHOR_SEEDS_MAX,
+    ANCHOR_SEEDS_POOL,
     MAX_ARTISTS,
     STATIC_CAPTURE_K_DEFAULT,
     STATIC_CAPTURE_K_MAX,
 )
+from .parsing import parse_anchor_seed_list
 
 
 class AnimaArtistOptions:
@@ -59,6 +61,14 @@ class AnimaArtistOptions:
                     "default": False,
                     "tooltip": "Use fixed-seed anchor hidden states as artist-attn Q.",
                 }),
+                "anchor_seed_list": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": (
+                        "Optional fixed anchor seeds, e.g. 12345,67890. "
+                        "When filled, anchor_seeds_count is ignored."
+                    ),
+                }),
                 "anchor_seeds_count": ("INT", {
                     "default": 1, "min": 1, "max": ANCHOR_SEEDS_MAX, "step": 1,
                     "tooltip": "Number of fixed anchor seeds to average.",
@@ -86,18 +96,25 @@ class AnimaArtistOptions:
             },
         }
 
-    RETURN_TYPES = ("ANIMA_OPTS",)
-    RETURN_NAMES = ("advanced_options",)
+    RETURN_TYPES = ("ANIMA_OPTS", "STRING")
+    RETURN_NAMES = ("advanced_options", "anchor_seeds_used")
     FUNCTION = "build"
     CATEGORY = "Anima/CrossAttn"
 
     def build(self, start_block, end_block, start_percent, end_percent, normalize_weights,
               artist_ema_alpha=0.0, lowrank_k=1, artist_static_capture=False,
               static_capture_k=STATIC_CAPTURE_K_DEFAULT, artist_anchor_q=False,
-              anchor_seeds_count=1, anchor_user_blend=0.0,
+              anchor_seed_list="", anchor_seeds_count=1, anchor_user_blend=0.0,
               anchor_deep_layer_threshold=ANCHOR_LAYER_THRESHOLD_DISABLED,
               stabilizer_end_percent=1.0,
               layer_filter=""):
+        manual_seeds = parse_anchor_seed_list(anchor_seed_list, ANCHOR_SEEDS_MAX)
+        if manual_seeds:
+            seeds_used = manual_seeds
+        else:
+            seeds_count = max(1, min(int(anchor_seeds_count), ANCHOR_SEEDS_MAX))
+            seeds_used = ANCHOR_SEEDS_POOL[:seeds_count]
+
         return ({
             "start_block": int(start_block),
             "end_block": int(end_block),
@@ -109,12 +126,13 @@ class AnimaArtistOptions:
             "artist_static_capture": bool(artist_static_capture),
             "static_capture_k": int(static_capture_k),
             "artist_anchor_q": bool(artist_anchor_q),
+            "anchor_seed_list": str(anchor_seed_list or ""),
             "anchor_seeds_count": int(anchor_seeds_count),
             "anchor_user_blend": float(anchor_user_blend),
             "anchor_deep_layer_threshold": int(anchor_deep_layer_threshold),
             "stabilizer_end_percent": float(stabilizer_end_percent),
             "layer_filter": str(layer_filter or ""),
-        },)
+        }, ",".join(str(seed) for seed in seeds_used))
 
 
 class AnimaArtistStructureOptions:
@@ -151,4 +169,33 @@ class AnimaArtistStructureOptions:
         opts = dict(advanced_options or {})
         opts["structure_preserve"] = max(0.0, min(1.0, float(structure_preserve)))
         opts["delta_norm_cap"] = max(0.0, min(4.0, float(delta_norm_cap)))
+        return (opts,)
+
+
+class AnimaArtistStyleBalance:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "style_balance": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": (
+                        "Reduces seed-to-seed artist dominance drift by matching "
+                        "artist output volume before user weights are applied."
+                    ),
+                }),
+            },
+            "optional": {
+                "advanced_options": ("ANIMA_OPTS",),
+            },
+        }
+
+    RETURN_TYPES = ("ANIMA_OPTS",)
+    RETURN_NAMES = ("advanced_options",)
+    FUNCTION = "build"
+    CATEGORY = "Anima/CrossAttn"
+
+    def build(self, style_balance=0.0, advanced_options=None):
+        opts = dict(advanced_options or {})
+        opts["style_balance"] = max(0.0, min(1.0, float(style_balance)))
         return (opts,)

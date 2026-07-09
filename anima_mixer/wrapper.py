@@ -23,6 +23,7 @@ from .patching import (
     in_sigma_range,
     in_stabilizer_window,
     resolve_mask,
+    resolve_strengths,
 )
 
 logger = logging.getLogger(__name__)
@@ -191,26 +192,37 @@ class CrossAttnWrapper(nn.Module):
 
     def _apply_fusion(self, base_out, artist_total, mask, fusion_mode, strength):
         row_mask = _row_mask_like(mask, base_out)
+        row_strength = self._row_strength_like(strength, base_out)
         preserve = float(self._st.get("structure_preserve", 0.0))
         cap = float(self._st.get("delta_norm_cap", 0.0))
         if preserve <= 0.0 and cap <= 0.0:
             if fusion_mode == FUSION_BASE_PRESERVE:
                 delta = artist_total - base_out
                 delta_perp = project_perpendicular(delta, base_out)
-                blended = base_out + strength * delta_perp
+                blended = base_out + row_strength * delta_perp
                 return torch.where(row_mask, blended, base_out)
-            blended = base_out * (1.0 - strength) + artist_total * strength
+            if torch.is_tensor(row_strength):
+                blended = base_out + row_strength * (artist_total - base_out)
+            else:
+                blended = base_out * (1.0 - row_strength) + artist_total * row_strength
             return torch.where(row_mask, blended, base_out)
 
         delta = artist_total - base_out
         if fusion_mode == FUSION_BASE_PRESERVE:
             delta = project_perpendicular(delta, base_out)
             delta = self._limit_structure_delta(delta, base_out)
-            blended = base_out + strength * delta
+            blended = base_out + row_strength * delta
             return torch.where(row_mask, blended, base_out)
         delta = self._structure_preserved_delta(delta, base_out)
-        blended = base_out + strength * delta
+        blended = base_out + row_strength * delta
         return torch.where(row_mask, blended, base_out)
+
+    def _row_strength_like(self, strength, ref):
+        if isinstance(strength, (list, tuple)):
+            return torch.tensor(
+                strength, device=ref.device, dtype=ref.dtype,
+            ).view(len(strength), *([1] * (ref.dim() - 1)))
+        return float(strength)
 
     def _structure_preserved_delta(self, delta, base_out):
         preserve = max(0.0, min(1.0, float(self._st.get("structure_preserve", 0.0))))
@@ -226,12 +238,20 @@ class CrossAttnWrapper(nn.Module):
         return limit_delta_norm(delta, base_out, cap)
 
     def _can_return_artist_directly(self, fusion_mode, strength, mask):
+        if isinstance(strength, (list, tuple)):
+            strength_is_one = all(
+                (not m) or abs(float(s) - 1.0) < 1e-6
+                for s, m in zip(strength, mask)
+            )
+        else:
+            strength_is_one = abs(float(strength) - 1.0) < 1e-6
         return (
             fusion_mode == FUSION_INTERPOLATE
-            and strength == 1.0
+            and strength_is_one
             and all(mask)
             and float(self._st.get("structure_preserve", 0.0)) <= 0.0
             and float(self._st.get("delta_norm_cap", 0.0)) <= 0.0
+            and float(self._st.get("style_balance", 0.0)) <= 0.0
         )
 
     def forward(self, x, context=None, rope_emb=None, transformer_options=None):
@@ -291,6 +311,9 @@ class CrossAttnWrapper(nn.Module):
         cou = transformer_options.get("cond_or_uncond") if isinstance(transformer_options, dict) else None
         bsz = context.shape[0]
         mask = resolve_mask(cou, bsz, st["apply_to_uncond"], st)
+        strengths = resolve_strengths(
+            cou, bsz, st["apply_to_uncond"], strength, st.get("uncond_strength", 1.0)
+        )
 
         if not any(mask):
             return self.original(
@@ -303,20 +326,20 @@ class CrossAttnWrapper(nn.Module):
         if combine_mode == COMBINE_LOWRANK_AVG and len(individuals) >= 2:
             return self._fwd_lowrank_avg(
                 x, context, rope_emb, transformer_options,
-                individuals, weights, mask, fusion_mode, strength, fp=fp,
+                individuals, weights, mask, fusion_mode, strengths, fp=fp,
             )
 
         if combine_mode in (COMBINE_OUTPUT_AVG, COMBINE_LOWRANK_AVG):
             return self._fwd_output_avg(
                 x, context, rope_emb, transformer_options,
-                individuals, weights, mask, fusion_mode, strength, fp=fp,
+                individuals, weights, mask, fusion_mode, strengths, fp=fp,
             )
 
         combined = _combine_concat(individuals, weights)
         combined_fp = tuple(round(float(w), 6) for w in weights)
         return self._fwd_with_combined(
             x, context, rope_emb, transformer_options,
-            combined, mask, fusion_mode, strength, fp=fp, extra_fp=combined_fp,
+            combined, mask, fusion_mode, strengths, fp=fp, extra_fp=combined_fp,
         )
 
     def _resolved_weights(self, weights):
@@ -335,7 +358,16 @@ class CrossAttnWrapper(nn.Module):
         )
 
         artist_total = None
-        if force_collect:
+        style_balance = float(self._st.get("style_balance", 0.0))
+        if style_balance > 0.0:
+            base_out = self.original(x, context, rope_emb=rope_emb, transformer_options=t_opts)
+            outs = self._get_artist_outputs_with_cache(
+                x, context, rope_emb, t_opts, individuals, fusion_mode, fp=fp,
+            )
+            outs = self._balance_artist_outputs(outs, base_out)
+            for out_i, w in zip(outs, ws):
+                artist_total = out_i * w if artist_total is None else artist_total + out_i * w
+        elif force_collect:
             outs = self._get_artist_outputs_with_cache(
                 x, context, rope_emb, t_opts, individuals, fusion_mode, fp=fp,
             )
@@ -372,8 +404,30 @@ class CrossAttnWrapper(nn.Module):
 
         if self._can_return_artist_directly(fusion_mode, strength, mask):
             return artist_total
-        base_out = self.original(x, context, rope_emb=rope_emb, transformer_options=t_opts)
+        if "base_out" not in locals():
+            base_out = self.original(x, context, rope_emb=rope_emb, transformer_options=t_opts)
         return self._apply_fusion(base_out, artist_total, mask, fusion_mode, strength)
+
+    def _balance_artist_outputs(self, artist_outs, base_out):
+        balance = max(0.0, min(1.0, float(self._st.get("style_balance", 0.0))))
+        if balance <= 0.0 or len(artist_outs) < 2:
+            return artist_outs
+
+        base_f32 = base_out.to(torch.float32)
+        deltas = torch.stack(
+            [(out - base_out).to(torch.float32) for out in artist_outs],
+            dim=0,
+        )
+        flat = deltas.reshape(deltas.shape[0], deltas.shape[1], -1)
+        norms = torch.linalg.vector_norm(flat, dim=-1).clamp(min=1e-8)
+        target = norms.mean(dim=0, keepdim=True)
+        scale = (target / norms).clamp(min=0.5, max=2.0)
+        scale = scale.view(deltas.shape[0], deltas.shape[1], *([1] * (deltas.dim() - 2)))
+        balanced = deltas * (1.0 - balance) + deltas * scale * balance
+        return [
+            (base_f32 + balanced[i]).to(device=artist_outs[i].device, dtype=artist_outs[i].dtype)
+            for i in range(len(artist_outs))
+        ]
 
     def _get_anchor_q_x(self, x):
         st = self._st
@@ -488,6 +542,7 @@ class CrossAttnWrapper(nn.Module):
             x, context, rope_emb, t_opts, individuals, fusion_mode, fp=fp,
         )
         base_out = self.original(x, context, rope_emb=rope_emb, transformer_options=t_opts)
+        artist_outs = self._balance_artist_outputs(artist_outs, base_out)
         out_dtype = base_out.dtype
 
         a = torch.stack(artist_outs, dim=0).to(torch.float32)

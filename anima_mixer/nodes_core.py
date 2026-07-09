@@ -18,6 +18,7 @@ from .constants import (
 )
 from .parsing import (
     expand_prompt_weights,
+    parse_anchor_seed_list,
     parse_artist_entries,
     parse_layer_filter,
     split_artist_chain,
@@ -160,6 +161,13 @@ class AnimaArtistCrossAttn:
                 }),
                 "enabled": ("BOOLEAN", {"default": True}),
                 "apply_to_uncond": ("BOOLEAN", {"default": False}),
+                "uncond_strength": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": (
+                        "When apply_to_uncond is enabled, scale artist injection "
+                        "on uncond rows. 1.0 keeps the old full-uncond behavior."
+                    ),
+                }),
             },
             "optional": {
                 "advanced_options": ("ANIMA_OPTS",),
@@ -172,7 +180,8 @@ class AnimaArtistCrossAttn:
     CATEGORY = "Anima/CrossAttn"
 
     def patch(self, model, artist_pack, combine_mode, fusion_mode,
-              strength, enabled, apply_to_uncond, advanced_options=None):
+              strength, enabled, apply_to_uncond, uncond_strength=1.0,
+              advanced_options=None):
         adv = advanced_options or {}
         sb = int(adv.get("start_block", 0))
         eb = int(adv.get("end_block", -1))
@@ -181,12 +190,16 @@ class AnimaArtistCrossAttn:
         normalize_w = bool(adv.get("normalize_weights", True))
         structure_preserve = max(0.0, min(1.0, float(adv.get("structure_preserve", 0.0))))
         delta_norm_cap = max(0.0, min(4.0, float(adv.get("delta_norm_cap", 0.0))))
+        style_balance = max(0.0, min(1.0, float(adv.get("style_balance", 0.0))))
         artist_ema_alpha = float(adv.get("artist_ema_alpha", 0.0))
         lowrank_k = int(adv.get("lowrank_k", 1))
         artist_static_capture = bool(adv.get("artist_static_capture", False))
         static_capture_k = int(adv.get("static_capture_k", STATIC_CAPTURE_K_DEFAULT))
         static_capture_k = max(1, min(static_capture_k, STATIC_CAPTURE_K_MAX))
         artist_anchor_q = bool(adv.get("artist_anchor_q", False))
+        anchor_seed_list = parse_anchor_seed_list(
+            adv.get("anchor_seed_list", ""), ANCHOR_SEEDS_MAX
+        )
         anchor_seeds_count = int(adv.get("anchor_seeds_count", 1))
         anchor_seeds_count = max(1, min(anchor_seeds_count, ANCHOR_SEEDS_MAX))
         anchor_user_blend = max(0.0, min(1.0, float(adv.get("anchor_user_blend", 0.0))))
@@ -197,6 +210,7 @@ class AnimaArtistCrossAttn:
             0.0, min(1.0, float(adv.get("stabilizer_end_percent", 1.0)))
         )
         layer_filter_text = str(adv.get("layer_filter", "") or "")
+        uncond_strength = max(0.0, min(1.0, float(uncond_strength)))
 
         if not isinstance(artist_pack, dict):
             raise ValueError(
@@ -283,12 +297,30 @@ class AnimaArtistCrossAttn:
                 "[AnimaCrossAttn] delta_norm_cap=%.2f limits artist delta "
                 "relative to base attention output.", delta_norm_cap,
             )
+        if style_balance > 0.0:
+            logger.info(
+                "[AnimaCrossAttn] style_balance=%.2f is active; artist outputs "
+                "are volume-matched before user weights are applied.",
+                style_balance,
+            )
 
         if float(strength) > 1.0:
             logger.info(
                 "[AnimaCrossAttn] strength=%.2f > 1.0 enters extrapolation: "
                 "out = base + %.2f * (artist - base).",
                 float(strength), float(strength),
+            )
+        if apply_to_uncond and uncond_strength < 1.0:
+            logger.info(
+                "[AnimaCrossAttn] apply_to_uncond=True with "
+                "uncond_strength=%.2f; uncond rows receive partial artist injection.",
+                uncond_strength,
+            )
+        if artist_anchor_q and anchor_seed_list:
+            logger.info(
+                "[AnimaCrossAttn] using manual anchor_seed_list=%s; "
+                "anchor_seeds_count is ignored.",
+                ",".join(str(seed) for seed in anchor_seed_list),
             )
 
         effective_weight_sum = sum(abs(w) for w in user_weights)
@@ -375,6 +407,7 @@ class AnimaArtistCrossAttn:
             "combine_mode": combine_mode,
             "strength": float(strength),
             "apply_to_uncond": bool(apply_to_uncond),
+            "uncond_strength": uncond_strength,
             "raws": raws,
             "ids_list": ids_list,
             "w_list": w_list,
@@ -383,11 +416,13 @@ class AnimaArtistCrossAttn:
             "has_explicit_weights": has_explicit_weights,
             "structure_preserve": structure_preserve,
             "delta_norm_cap": delta_norm_cap,
+            "style_balance": style_balance,
             "artist_ema_alpha": artist_ema_alpha,
             "lowrank_k": lowrank_k,
             "artist_static_capture": artist_static_capture,
             "static_capture_k": static_capture_k,
             "artist_anchor_q": artist_anchor_q,
+            "anchor_seed_list": anchor_seed_list,
             "anchor_seeds_count": anchor_seeds_count,
             "anchor_user_blend": anchor_user_blend,
             "anchor_deep_layer_threshold": anchor_deep_layer_threshold,

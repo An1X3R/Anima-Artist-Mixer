@@ -35,12 +35,16 @@ It has two output ports: a model output and a base_prompt output
 	Recommended range 1.5~2.5, >3 easily oversaturates
 	Don't push both strength and ::weight high at the same time when artist count is large
 5. enabled toggles the node on/off
-6. apply_to_uncond toggles mixing the artist chain into negative prompts, not recommended
+6. apply_to_uncond toggles mixing the artist chain into uncond/negative rows
+	uncond_strength controls how much artist injection uncond rows receive when enabled
+	0.0=no uncond injection, 0.15~0.35=weak influence, 1.0=old full-uncond behavior
 7. Output wiring: the model output goes directly into KSampler; base_prompt goes to KSampler's positive (positive conditioning)
 
 Anima Artist Options(Advanced)
 Provides advanced settings for users
-1. This node has only one output, connecting to Anima Artist Cross-Attn's optional input
+1. This node outputs advanced_options plus anchor_seeds_used
+	advanced_options connects to Anima Artist Cross-Attn's optional input
+	anchor_seeds_used is a text list of the seeds used by anchor_q
 2. Basic settings: layer range, sampling-progress range, normalize toggle, layer_filter (custom layer selection)
 3. Stability-related parameters (for resolving multi-artist cross-seed style drift):
 	artist_ema_alpha             cross-step EMA smoothing, 0=off, 0.3~0.5 light, 0.5~0.8 medium-heavy
@@ -48,6 +52,7 @@ Provides advanced settings for users
 	artist_static_capture        accumulate artist attention for the first K steps then freeze, 30~50% performance gain
 	static_capture_k             the K above, default 6, range 1~12
 	artist_anchor_q              use a fixed-seed anchor instead of user-seed Q, the most stable approach across seeds
+	anchor_seed_list             optional manual anchor seeds, e.g. 12345,67890; when filled, anchor_seeds_count is ignored
 	anchor_seeds_count           number of anchor seeds, default 1, range 1~4
 	anchor_user_blend            anchor / user-x blend ratio, 0=pure anchor, 1=pure user x
 	anchor_deep_layer_threshold  shallow layers use anchor for stable style, deep layers use user x for fine brushwork, -1=disabled
@@ -60,3 +65,10 @@ Optional helper node for object/composition stability experiments
 2. structure_preserve pushes interpolate deltas toward the safer base_preserve direction
 3. delta_norm_cap limits artist delta magnitude relative to the base attention output
 4. Both default to 0.0, which keeps old behavior unchanged
+
+Anima Artist Style Balance
+Optional helper node for reducing seed-to-seed artist dominance drift
+1. Connect it between Anima Artist Options(Advanced) and Anima Artist Cross-Attn
+2. style_balance matches each artist's output volume before user weights are applied
+3. ::artist::weight still works normally after style_balance
+4. Try 0.25~0.35 for light stabilization, 0.45~0.60 for stronger stabilization

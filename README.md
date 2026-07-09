@@ -18,6 +18,7 @@ The normal workflow still uses three main nodes:
 - `Anima Artist Options (Advanced)`
 
 There is also an optional `Anima Artist Structure Guard` node for object/composition stability experiments.
+`Anima Artist Style Balance` can be used when different seeds make different artists dominate the mix.
 
 ## Installation
 
@@ -109,6 +110,17 @@ With `normalize_weights=true`, this becomes a 1:2 relative mix, not a 3x amplifi
 - `1.0`: normal artist mix.
 - `>1.0`: extrapolates style strength. Useful, but can damage structure if pushed too high.
 
+### apply_to_uncond and uncond_strength
+
+`apply_to_uncond` is off by default. Leave it off for stable CFG behavior.
+
+When `apply_to_uncond` is enabled, `uncond_strength` controls how much artist injection is applied to uncond rows:
+
+- `0.0`: no artist injection on uncond rows.
+- `0.15 - 0.35`: weak uncond style influence.
+- `0.4 - 0.65`: stronger experimental influence.
+- `1.0`: old full-uncond injection behavior.
+
 ## Advanced Options
 
 `Anima Artist Options (Advanced)` exposes:
@@ -121,6 +133,7 @@ With `normalize_weights=true`, this becomes a 1:2 relative mix, not a 3x amplifi
 - `artist_static_capture`
 - `static_capture_k`
 - `artist_anchor_q`
+- `anchor_seed_list`
 - `anchor_seeds_count`
 - `anchor_user_blend`
 - `anchor_deep_layer_threshold`
@@ -128,6 +141,8 @@ With `normalize_weights=true`, this becomes a 1:2 relative mix, not a 3x amplifi
 - optional `layer_filter`
 
 The advanced node intentionally keeps its original widget order for workflow compatibility. New experimental controls are placed in separate helper nodes.
+
+It also outputs `anchor_seeds_used`, a text list of the anchor seeds that will be used. If `anchor_seed_list` is empty, this shows the built-in seeds selected by `anchor_seeds_count`; if `anchor_seed_list` is filled, it shows the parsed manual list.
 
 ## Structure Guard
 
@@ -157,6 +172,39 @@ delta_norm_cap     = 1.0 - 1.5
 ```
 
 If an existing workflow suddenly produces bad structure after an update, recreate the `Anima Artist Options (Advanced)` node once so ComfyUI refreshes its widget mapping.
+
+## Style Balance
+
+`Anima Artist Style Balance` is optional. Connect it like other option helper nodes:
+
+```text
+Anima Artist Options (Advanced) -> Anima Artist Style Balance -> Anima Artist Cross-Attn
+```
+
+It adds:
+
+- `style_balance`: reduces seed-to-seed artist dominance drift by matching each artist's output volume before user weights are applied.
+
+This does not replace `::artist::weight` or `1.2::artist`. The balance step happens first, then your artist weights are still applied normally.
+
+Suggested tests:
+
+```text
+style_balance = 0.25 - 0.35  # light
+style_balance = 0.45 - 0.60  # stronger
+```
+
+Very high values can make different artists feel more averaged.
+
+## Manual Anchor Seeds
+
+When `artist_anchor_q` is enabled, `anchor_seed_list` can pin the anchor pass to seeds you choose:
+
+```text
+anchor_seed_list = 12345,67890
+```
+
+If `anchor_seed_list` is empty, `anchor_seeds_count` uses the built-in anchor seeds as before. If `anchor_seed_list` is filled, `anchor_seeds_count` is ignored. You can also enter a single seed to lock the style reference to one selected result.
 
 ## Recent Fixes
 

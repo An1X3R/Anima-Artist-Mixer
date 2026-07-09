@@ -44,7 +44,9 @@ Each layer's injection is wrapped in exception isolation: if a single layer's in
 
 ### CFG compatibility
 
-ComfyUI batches cond and uncond into a single `batch=2` forward, with `transformer_options["cond_or_uncond"]` marking each row. This node injects only into the cond rows by default; uncond rows keep their original base context, so CFG guidance is preserved naturally. `apply_to_uncond` defaults to False and is not recommended to enable.
+ComfyUI batches cond and uncond into a single `batch=2` forward, with `transformer_options["cond_or_uncond"]` marking each row. This node injects only into the cond rows by default; uncond rows keep their original base context, so CFG guidance is preserved naturally.
+
+`apply_to_uncond` can also inject the artist mix into uncond rows. This is experimental: it can produce striking results, but it also changes CFG's reference branch and can destabilize structure. `uncond_strength` controls that uncond-side injection. `1.0` matches the old full-uncond behavior, while lower values such as `0.15~0.35` give a weaker influence.
 
 ## The cross-seed instability problem (and how v24 addresses it)
 
@@ -136,7 +138,8 @@ How it works internally: the node splits `artist_chain` into N artist names, par
 | `fusion_mode` | enum | How merged artists act on the main prompt: `interpolate` (recommended) / `concat_with_base` / `base_preserve` |
 | `strength` | FLOAT 0~4 | Overall artist contribution. 0~1 = interpolation, 1~4 = CFG-style extrapolation (style amplified) |
 | `enabled` | BOOLEAN | Master switch |
-| `apply_to_uncond` | BOOLEAN | Default False, **not recommended** (breaks CFG) |
+| `apply_to_uncond` | BOOLEAN | Default False. Enables artist injection on uncond rows |
+| `uncond_strength` | FLOAT 0~1 | Only used when `apply_to_uncond=True`. 0 = no uncond injection, 1 = old full-uncond behavior |
 | `advanced_options` | ANIMA_OPTS | Optional advanced controls |
 
 Outputs:
@@ -146,6 +149,10 @@ Outputs:
 ### AnimaArtistOptions (advanced)
 
 Not connecting this node = default behavior. Connecting it makes its settings take effect.
+
+Outputs:
+- `advanced_options`: connect to `AnimaArtistCrossAttn`
+- `anchor_seeds_used`: text list of the anchor seeds that will be used. If `anchor_seed_list` is empty, this shows the built-in seeds selected by `anchor_seeds_count`; otherwise it shows the parsed manual list
 
 | Parameter | Description |
 |---|---|
@@ -158,6 +165,7 @@ Not connecting this node = default behavior. Connecting it makes its settings ta
 | `artist_static_capture` | Freeze artist attention after `static_capture_k` warmup steps |
 | `static_capture_k` | Number of warmup steps before freezing. Default 6, range 1~12 |
 | `artist_anchor_q` | Replace user-seed Q with a fixed-seed anchor's Q. The strongest cross-seed stabilizer |
+| `anchor_seed_list` | Optional manual anchor seeds, e.g. `12345,67890`. When filled, `anchor_seeds_count` is ignored |
 | `anchor_seeds_count` | Number of anchor seeds to average. Default 1, range 1~4 |
 | `anchor_user_blend` | Blend ratio between anchor Q and user Q. 0 = pure anchor, 1 = pure user |
 | `anchor_deep_layer_threshold` | Use anchor for shallow layers `[0, N)`, user Q for deep layers `[N, end]`. -1 disables |
@@ -178,6 +186,22 @@ AnimaArtistOptions -> AnimaArtistStructureOptions -> AnimaArtistCrossAttn
 | `delta_norm_cap` | Caps artist delta magnitude relative to base attention output. `0.0` disables the cap |
 
 For object-heavy prompts, try `structure_preserve=0.25~0.50` with `interpolate`, or `delta_norm_cap=1.0~1.5` with `base_preserve`.
+
+### Optional Style Balance
+
+`AnimaArtistStyleBalance` is a separate helper node for reducing seed-to-seed artist dominance drift.
+
+Connect it as:
+
+```
+AnimaArtistOptions -> AnimaArtistStyleBalance -> AnimaArtistCrossAttn
+```
+
+| Parameter | Description |
+|---|---|
+| `style_balance` | Matches each artist output's volume before user weights are applied. `0.0` keeps old behavior |
+
+This does not replace injection weights. For example, `1::wlop, 2::sakimichan` still applies a 1:2 user weight ratio after the balance step. Try `0.25~0.35` for light stabilization and `0.45~0.60` for stronger stabilization.
 
 ## Core concepts
 
@@ -310,7 +334,8 @@ First-time cost: ~1 extra step worth of forward time for the anchor pass. After 
 
 **Sub-options for finer control**:
 
-- `anchor_seeds_count` (1~4, default 1): runs N anchor passes with different fixed seeds and averages their hidden states. Mitigates the small chance that a single fixed seed produces a systematically biased anchor. Cost scales linearly with N.
+- `anchor_seed_list` (optional): manually specify fixed anchor seeds, e.g. `12345,67890`. If filled, this list is used directly and `anchor_seeds_count` is ignored. A single seed can lock the style reference to one selected result.
+- `anchor_seeds_count` (1~4, default 1): when `anchor_seed_list` is empty, runs N anchor passes with different fixed seeds and averages their hidden states. Mitigates the small chance that a single fixed seed produces a systematically biased anchor. Cost scales linearly with N.
 - `anchor_user_blend` (0~1, default 0): blends anchor Q with user Q. 0 = pure anchor (max stability), 1 = pure user (equivalent to disabling anchor). Useful if pure anchor produces brushwork that looks slightly disconnected from the actual content.
 - `anchor_deep_layer_threshold` (-1~64, default -1 = disabled): when set to N, layers `[0, N)` use anchor Q (style stability) while layers `[N, end]` use user Q (content fidelity). Based on the principle that early DiT blocks set style and late blocks add detail.
 

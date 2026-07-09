@@ -1,5 +1,7 @@
 """Parsing helpers for artist chains, weights, layer filters, and prompts."""
 
+import re
+
 from .constants import WEIGHT_MAX, WEIGHT_MIN
 
 
@@ -143,6 +145,32 @@ def parse_layer_filter(text, num_blocks):
     if recognized:
         return []
     return None
+
+
+def parse_anchor_seed_list(text, max_count):
+    if not text:
+        return []
+    s = str(text).replace("，", ",")
+    parts = re.split(r"[\s,;]+", s)
+    seeds = []
+    seen = set()
+    for part in parts:
+        if not part:
+            continue
+        try:
+            seed = int(part)
+        except ValueError:
+            continue
+        if seed < 0:
+            continue
+        seed = seed % (2 ** 63)
+        if seed in seen:
+            continue
+        seen.add(seed)
+        seeds.append(seed)
+        if len(seeds) >= max_count:
+            break
+    return seeds
 
 
 def normalize_weights(weights):

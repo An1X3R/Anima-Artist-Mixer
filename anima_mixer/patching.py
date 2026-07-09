@@ -166,6 +166,19 @@ def broadcast_batch(t, batch_size):
     return t[:1].expand(batch_size, -1, -1)
 
 
+def _expand_cond_flags(cou, batch_size):
+    if cou is not None and len(cou) > 0:
+        if len(cou) == batch_size:
+            return [c == 0 for c in cou]
+        if batch_size % len(cou) == 0:
+            chunk = batch_size // len(cou)
+            flags = []
+            for c in cou:
+                flags.extend([c == 0] * chunk)
+            return flags
+    return None
+
+
 def resolve_mask(cou, batch_size, apply_to_uncond, state):
     """Build a per-row mask from ComfyUI's cond_or_uncond marker.
 
@@ -176,15 +189,9 @@ def resolve_mask(cou, batch_size, apply_to_uncond, state):
     """
     if apply_to_uncond:
         return [True] * batch_size
-    if cou is not None and len(cou) > 0:
-        if len(cou) == batch_size:
-            return [c == 0 for c in cou]
-        if batch_size % len(cou) == 0:
-            chunk = batch_size // len(cou)
-            mask = []
-            for c in cou:
-                mask.extend([c == 0] * chunk)
-            return mask
+    mask = _expand_cond_flags(cou, batch_size)
+    if mask is not None:
+        return mask
     if not state.get("_warned", False):
         logger.warning(
             "[AnimaCrossAttn] cond_or_uncond markers unusable (got=%s, batch=%d); "
@@ -193,6 +200,20 @@ def resolve_mask(cou, batch_size, apply_to_uncond, state):
         )
         state["_warned"] = True
     return [True] * batch_size
+
+
+def resolve_strengths(cou, batch_size, apply_to_uncond, strength, uncond_strength):
+    strength = float(strength)
+    if not apply_to_uncond:
+        return [strength] * batch_size
+    cond_flags = _expand_cond_flags(cou, batch_size)
+    if cond_flags is None:
+        return [strength] * batch_size
+    uncond_strength = max(0.0, min(1.0, float(uncond_strength)))
+    return [
+        strength if is_cond else strength * uncond_strength
+        for is_cond in cond_flags
+    ]
 
 
 def in_sigma_range(state):
