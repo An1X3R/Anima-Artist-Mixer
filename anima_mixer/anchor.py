@@ -5,7 +5,12 @@ import logging
 import torch
 
 from .constants import ANCHOR_SEEDS_MAX, ANCHOR_SEEDS_POOL
-from .patching import context_fingerprint, in_stabilizer_window, reset_run_state
+from .patching import (
+    context_fingerprint,
+    in_stabilizer_window,
+    reset_run_state,
+    should_reraise,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +20,13 @@ def _get_crossattn_context(c_dict):
     if context is None:
         context = c_dict.get("c_crossattn")
     return context
+
+
+def _condition_row_index(row_count, cond_or_uncond, condition_index):
+    """Map a ComfyUI condition-group index to its first tensor row."""
+    if cond_or_uncond and row_count % len(cond_or_uncond) == 0:
+        return condition_index * (row_count // len(cond_or_uncond))
+    return condition_index if condition_index < row_count else 0
 
 
 def make_sigma_capture(state, prev_wrapper):
@@ -74,7 +86,7 @@ def maybe_run_anchor(state, user_x, user_timestep, c_dict, apply_model=None):
         cond_idx = cou.index(0)
 
     if base_context.dim() >= 2 and base_context.shape[0] > 1:
-        row = cond_idx if cond_idx < base_context.shape[0] else 0
+        row = _condition_row_index(base_context.shape[0], cou, cond_idx)
         base_context = base_context[row:row + 1]
 
     try:
@@ -119,7 +131,7 @@ def maybe_run_anchor(state, user_x, user_timestep, c_dict, apply_model=None):
             if v.shape[0] == 1:
                 v = v.expand(bsz, *v.shape[1:])
             else:
-                row = cond_idx if cond_idx < v.shape[0] else 0
+                row = _condition_row_index(v.shape[0], cou, cond_idx)
                 v = v[row:row + 1].expand(bsz, *v.shape[1:])
         anchor_kwargs[key] = v.contiguous()
 
@@ -171,6 +183,8 @@ def maybe_run_anchor(state, user_x, user_timestep, c_dict, apply_model=None):
                 idx: (acc * inv).to(user_x.dtype) for idx, acc in accumulator.items()
             }
     except Exception as e:
+        if should_reraise(e):
+            raise
         logger.warning(
             "[AnimaCrossAttn] anchor pre-run failed; anchor_q is disabled: %s", e,
         )

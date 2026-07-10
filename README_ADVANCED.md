@@ -392,13 +392,15 @@ wlop, ::sakimichan::1.2, (krenz:0.7)
 
 ### Computational cost
 
-In `output_avg` and `lowrank_avg` modes, each layer runs `N + 1` cross-attention forwards (N artists + base). This is mathematical necessity:
+In `output_avg` and `lowrank_avg` modes, each artist still needs an independent attention softmax plus the base attention. This is mathematically necessary:
 
 ```
 sum_i (w_i * softmax(Q @ K_i^T / √d) @ V_i)
 ```
 
-Each softmax must be computed independently over its own K, V. Merging into a single large attention would degrade the semantics to `concat` mode.
+Each softmax must be computed independently over its own K, V. Merging them into one shared softmax would degrade the semantics to `concat` mode. On compatible Anima attention modules, the plugin now reuses the shared Q projection and only repeats the artist-specific K/V and softmax work. The first compatible module is checked against the original path at runtime before this optimization is enabled.
+
+Artist batching is VRAM-aware. The plugin checks available VRAM once per sampling shape and automatically chooses how many artists to process together. It uses full parallel batching when memory is plentiful and smaller chunks when memory is tight. Q remains shared across chunks, including the one-artist-per-chunk fallback. This changes execution order only; artist weighting and fusion formulas remain unchanged.
 
 ### Approximate timing (30 steps, varies by GPU)
 

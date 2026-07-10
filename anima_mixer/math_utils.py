@@ -4,9 +4,13 @@ import torch
 
 
 def project_perpendicular(delta, base):
-    base_norm_sq = (base * base).sum(dim=-1, keepdim=True).clamp(min=1e-8)
-    proj_coef = (delta * base).sum(dim=-1, keepdim=True) / base_norm_sq
-    return delta - proj_coef * base
+    # FP16 rounds 1e-8 to zero, so the old denominator guard could still
+    # produce NaNs for zero or near-zero attention rows.
+    delta_f32 = delta.to(torch.float32)
+    base_f32 = base.to(torch.float32)
+    base_norm_sq = (base_f32 * base_f32).sum(dim=-1, keepdim=True).clamp(min=1e-8)
+    proj_coef = (delta_f32 * base_f32).sum(dim=-1, keepdim=True) / base_norm_sq
+    return (delta_f32 - proj_coef * base_f32).to(delta.dtype)
 
 
 def limit_delta_norm(delta, base, cap_ratio):

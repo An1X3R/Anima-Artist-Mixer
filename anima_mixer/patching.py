@@ -7,6 +7,24 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def should_reraise(error):
+    """Return True for errors that must abort sampling immediately."""
+    for name in ("OutOfMemoryError",):
+        cuda_error = getattr(getattr(torch, "cuda", None), name, None)
+        if cuda_error is not None and isinstance(error, cuda_error):
+            return True
+        torch_error = getattr(torch, name, None)
+        if torch_error is not None and isinstance(error, torch_error):
+            return True
+    try:
+        from comfy.model_management import InterruptProcessingException
+        if isinstance(error, InterruptProcessingException):
+            return True
+    except ImportError:
+        pass
+    return False
+
+
 def in_stabilizer_window(state):
     threshold = state.get("stabilizer_min_sigma")
     if threshold is None:
@@ -52,6 +70,7 @@ def reset_run_state(state):
     state["_ema_cache"] = {}
     state["_static_cache"] = {}
     state["_ctx_fp_memo"] = {}
+    state["_artist_chunk_cache"] = {}
     state["_anchor_failed"] = False
 
 

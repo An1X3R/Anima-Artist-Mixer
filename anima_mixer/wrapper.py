@@ -24,26 +24,10 @@ from .patching import (
     in_stabilizer_window,
     resolve_mask,
     resolve_strengths,
+    should_reraise,
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _should_reraise(error):
-    for name in ("OutOfMemoryError",):
-        cuda_error = getattr(getattr(torch, "cuda", None), name, None)
-        if cuda_error is not None and isinstance(error, cuda_error):
-            return True
-        torch_error = getattr(torch, name, None)
-        if torch_error is not None and isinstance(error, torch_error):
-            return True
-    try:
-        from comfy.model_management import InterruptProcessingException
-        if isinstance(error, InterruptProcessingException):
-            return True
-    except ImportError:
-        pass
-    return False
 
 
 def _combine_concat(individuals, weights):
@@ -287,7 +271,7 @@ class CrossAttnWrapper(nn.Module):
         try:
             return self._dispatch(x, context, rope_emb, transformer_options)
         except Exception as e:
-            if _should_reraise(e):
+            if should_reraise(e):
                 raise
             logger.exception(
                 "[AnimaCrossAttn] L%d injection failed; this layer falls back "
@@ -380,6 +364,8 @@ class CrossAttnWrapper(nn.Module):
                     q_x, context, rope_emb, t_opts, individuals, ws, fusion_mode,
                 )
             except Exception as e:
+                if should_reraise(e):
+                    raise
                 if not self._st.get("_warned_batched", False):
                     logger.warning(
                         "[AnimaCrossAttn] batched output_avg failed; falling "
@@ -475,6 +461,8 @@ class CrossAttnWrapper(nn.Module):
                     q_x, context, rope_emb, t_opts, individuals, fusion_mode,
                 )
             except Exception as e:
+                if should_reraise(e):
+                    raise
                 if not self._st.get("_warned_batched", False):
                     logger.warning(
                         "[AnimaCrossAttn] batched outputs failed; falling back "
@@ -492,6 +480,158 @@ class CrossAttnWrapper(nn.Module):
             outs.append(self.original(q_x, kv, rope_emb=rope_emb, transformer_options=t_opts))
         return outs
 
+    def _supports_q_reuse(self):
+        module = self.original_module
+        return bool(
+            module is not None
+            and not getattr(module, "is_selfattn", True)
+            and all(hasattr(module, name) for name in (
+                "q_proj", "q_norm", "k_proj", "k_norm", "v_proj",
+                "compute_attention", "n_heads", "head_dim",
+            ))
+        )
+
+    def _auto_artist_chunk_size(self, x, kv_length, artist_count):
+        if artist_count <= 1 or x.device.type not in ("cuda", "xpu", "npu", "mlu"):
+            return artist_count
+
+        cache = self._st.setdefault("_artist_chunk_cache", {})
+        key = (
+            x.device.type, x.device.index, str(x.dtype), tuple(x.shape),
+            int(kv_length), int(artist_count),
+        )
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+
+        chunk_size = artist_count
+        try:
+            from comfy import model_management
+
+            free_memory = int(model_management.get_free_memory(x.device))
+            module = self.original_module
+            inner_dim = int(
+                getattr(module, "n_heads", 1) * getattr(module, "head_dim", x.shape[-1])
+            )
+            batch_size = int(x.shape[0])
+            element_size = int(x.element_size())
+
+            # Per artist: repeated input/Q, attention output/final output, K/V,
+            # plus conservative SDPA workspace. The reserve leaves room for
+            # the rest of the DiT block and ComfyUI's allocator.
+            q_side = 4 * int(x.numel())
+            kv_side = 3 * batch_size * int(kv_length) * inner_dim
+            per_artist = max(1, int((q_side + kv_side) * element_size * 2.0))
+            reserve = max(768 * 1024 ** 2, int(free_memory * 0.20))
+            usable = max(0, free_memory - reserve)
+            chunk_size = max(1, min(artist_count, usable // per_artist))
+        except Exception as e:
+            logger.debug("[AnimaCrossAttn] automatic artist chunk sizing unavailable: %s", e)
+
+        cache[key] = int(chunk_size)
+        if chunk_size < artist_count and not self._st.get("_warned_auto_chunk", False):
+            logger.info(
+                "[AnimaCrossAttn] VRAM-aware artist batching: %d artists per chunk "
+                "(%d total).",
+                chunk_size, artist_count,
+            )
+            self._st["_warned_auto_chunk"] = True
+        return int(chunk_size)
+
+    @staticmethod
+    def _repeat_transformer_options(t_opts, repeat_count):
+        new_opts = dict(t_opts) if isinstance(t_opts, dict) else {}
+        cou = new_opts.get("cond_or_uncond")
+        if cou is not None and repeat_count > 1:
+            new_opts["cond_or_uncond"] = list(cou) * repeat_count
+        return new_opts
+
+    def _project_reusable_q(self, x):
+        module = self.original_module
+        q_shape = (*x.shape[:-1], module.n_heads, module.head_dim)
+        return module.q_norm(module.q_proj(x).view(q_shape))
+
+    def _q_reuse_artists_chunk(self, x, kv_stacked, rope_emb, t_opts, chunk_count,
+                               reusable_q=None):
+        module = self.original_module
+        bsz = x.shape[0]
+        kv_shape = (*kv_stacked.shape[:-1], module.n_heads, module.head_dim)
+
+        q = reusable_q if reusable_q is not None else self._project_reusable_q(x)
+        k = module.k_norm(module.k_proj(kv_stacked).view(kv_shape))
+        v = module.v_proj(kv_stacked).view(kv_shape)
+        v_norm = getattr(module, "v_norm", None)
+        if v_norm is not None:
+            v = v_norm(v)
+
+        q = q.repeat(chunk_count, *([1] * (q.dim() - 1)))
+        new_opts = self._repeat_transformer_options(t_opts, chunk_count)
+        out = module.compute_attention(q, k, v, transformer_options=new_opts)
+        return out.view(chunk_count, bsz, *out.shape[1:])
+
+    def _original_artists_chunk(self, x, kv_stacked, rope_emb, t_opts, chunk_count):
+        bsz = x.shape[0]
+        x_rep = x.repeat(chunk_count, *([1] * (x.dim() - 1)))
+        rope_rep = rope_emb
+        if rope_emb is not None and torch.is_tensor(rope_emb):
+            if rope_emb.dim() > 0 and rope_emb.shape[0] == bsz:
+                rope_rep = rope_emb.repeat(chunk_count, *([1] * (rope_emb.dim() - 1)))
+        new_opts = self._repeat_transformer_options(t_opts, chunk_count)
+        out = self.original(x_rep, kv_stacked, rope_emb=rope_rep, transformer_options=new_opts)
+        return out.view(chunk_count, bsz, *out.shape[1:])
+
+    def _artists_chunk_outputs(self, x, kv_list, rope_emb, t_opts, reusable_q=None):
+        chunk_count = len(kv_list)
+        kv_stacked = torch.cat(kv_list, dim=0)
+
+        if self._supports_q_reuse():
+            validation = self._st.setdefault("_q_reuse_validation", {})
+            module_type = type(self.original_module)
+            validated = validation.get(module_type)
+            if validated is True:
+                return self._q_reuse_artists_chunk(
+                    x, kv_stacked, rope_emb, t_opts, chunk_count,
+                    reusable_q=reusable_q,
+                )
+            if validated is None:
+                try:
+                    validation_kv = kv_list[0]
+                    optimized = self._q_reuse_artists_chunk(
+                        x, validation_kv, rope_emb, t_opts, 1,
+                        reusable_q=reusable_q,
+                    )
+                    reference = self._original_artists_chunk(
+                        x, kv_stacked, rope_emb, t_opts, chunk_count,
+                    )
+                    tolerance = 2e-3 if x.dtype in (torch.float16, torch.bfloat16) else 1e-5
+                    validated = bool(torch.allclose(
+                        optimized[0], reference[0], rtol=tolerance, atol=tolerance,
+                    ))
+                    validation[module_type] = validated
+                    if validated:
+                        logger.info(
+                            "[AnimaCrossAttn] Q projection reuse validated and enabled."
+                        )
+                        self._st["_warned_q_reuse"] = True
+                    else:
+                        logger.warning(
+                            "[AnimaCrossAttn] Q reuse validation differed from the original; "
+                            "the standard attention path remains active."
+                        )
+                    return reference
+                except Exception as e:
+                    if should_reraise(e):
+                        raise
+                    validation[module_type] = False
+                    logger.warning(
+                        "[AnimaCrossAttn] Q reuse validation failed; using the standard path: %s",
+                        e,
+                    )
+
+        return self._original_artists_chunk(
+            x, kv_stacked, rope_emb, t_opts, chunk_count,
+        )
+
     def _batched_artists_outputs_only(self, x, context, rope_emb, t_opts,
                                       individuals, fusion_mode):
         bsz = context.shape[0]
@@ -508,19 +648,21 @@ class CrossAttnWrapper(nn.Module):
         kv_lens = {kv.shape[1] for kv in kv_list}
         if len(kv_lens) > 1:
             raise ValueError(f"K/V lengths differ {kv_lens}; cannot batch")
-        x_rep = x.repeat(n, *([1] * (x.dim() - 1)))
-        kv_stacked = torch.cat(kv_list, dim=0)
-        rope_rep = rope_emb
-        if rope_emb is not None and torch.is_tensor(rope_emb):
-            if rope_emb.dim() > 0 and rope_emb.shape[0] == bsz:
-                rope_rep = rope_emb.repeat(n, *([1] * (rope_emb.dim() - 1)))
-        new_opts = dict(t_opts) if isinstance(t_opts, dict) else {}
-        cou = new_opts.get("cond_or_uncond")
-        if cou is not None:
-            new_opts["cond_or_uncond"] = list(cou) * n
-        out = self.original(x_rep, kv_stacked, rope_emb=rope_rep, transformer_options=new_opts)
-        out = out.view(n, bsz, *out.shape[1:])
-        return [out[i] for i in range(n)]
+        kv_length = next(iter(kv_lens))
+        chunk_size = self._auto_artist_chunk_size(x, kv_length, n)
+        reusable_q = None
+        if self._supports_q_reuse():
+            validation = self._st.setdefault("_q_reuse_validation", {})
+            if validation.get(type(self.original_module)) is not False:
+                reusable_q = self._project_reusable_q(x)
+        outputs = []
+        for start in range(0, n, chunk_size):
+            chunk = kv_list[start:start + chunk_size]
+            chunk_out = self._artists_chunk_outputs(
+                x, chunk, rope_emb, t_opts, reusable_q=reusable_q,
+            )
+            outputs.extend(chunk_out[i] for i in range(chunk_out.shape[0]))
+        return outputs
 
     def _batched_artists_forward(self, x, context, rope_emb, t_opts,
                                  individuals, weights, fusion_mode):
@@ -555,6 +697,8 @@ class CrossAttnWrapper(nn.Module):
             try:
                 rows = lowrank_rows_deterministic(rows, k)
             except Exception as e:
+                if should_reraise(e):
+                    raise
                 if not self._st.get("_warned_svd", False):
                     logger.warning(
                         "[AnimaCrossAttn] L%d lowrank_avg failed; this step "

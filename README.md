@@ -220,6 +220,9 @@ This version includes structural and runtime fixes inspired by PR #4 while keepi
 - Avoid zero-padding uncond rows in `concat_with_base`.
 - Reraise OOM and Comfy interrupt exceptions instead of silently disabling layers.
 - Add optional structure-guard controls without changing old advanced-option widget order.
+- Fix FP16 `base_preserve` projection NaNs and batched Anchor condition selection.
+- Reuse compatible Anima Q projections across artists after a runtime equivalence check.
+- Automatically split artist batches according to currently available VRAM.
 
 ## Caveats
 
