@@ -48,6 +48,32 @@ def context_fingerprint(context):
         return (tuple(context.shape), str(context.dtype), None)
 
 
+def tensor_cache_signature(tensor):
+    """Describe one retained tensor without reading or synchronizing its values."""
+    if tensor is None or not torch.is_tensor(tensor):
+        return None
+    try:
+        version = int(tensor._version)
+    except Exception:
+        version = None
+    try:
+        stride = tuple(tensor.stride())
+        storage_offset = int(tensor.storage_offset())
+    except Exception:
+        stride = None
+        storage_offset = None
+    return (
+        id(tensor),
+        tuple(tensor.shape),
+        stride,
+        storage_offset,
+        str(tensor.dtype),
+        tensor.device.type,
+        tensor.device.index,
+        version,
+    )
+
+
 def forward_fingerprint(state, context):
     if context is None:
         return None
@@ -72,6 +98,7 @@ def reset_run_state(state):
     state["_ctx_fp_memo"] = {}
     state["_artist_chunk_cache"] = {}
     state["_anchor_failed"] = False
+    state["_adapter_anchor_failed"] = False
 
 
 def extract_conditioning(conditioning):

@@ -1,12 +1,26 @@
 # Anima-Artist-Mixer
 
+## Version 26.8.1: New Adapter Mixer
+
+`Anima Artist Adapter Mixer (Experimental)` is the major addition in 26.8.1. It is an alternative to `Anima Artist Cross-Attn`: artist contexts are mixed once after LLMAdapter instead of mixing artist outputs repeatedly inside the patched attention layers. Current Anima testing approached twice the established path's throughput while retaining similar visual quality; actual results depend on the workflow and hardware.
+
+```text
+Anima Artist Pack -> Anima Artist Adapter Mixer -> KSampler model
+                                  |
+                                  +-> base_prompt -> KSampler positive
+```
+
+Use `base_anchored` alignment for the information-preserving default. It keeps every real base and artist Adapter row and does not pool or truncate prompt tokens. Optional Q-only Anchor accepts fixed manual seeds; `warm_cache` and `adaptive_q` can spend extra time on the first complete run and reuse bounded Q keyframes on later seeds.
+
+Do not chain Adapter Mixer and Cross-Attn Mixer. The remainder of this usage guide documents the established Cross-Attn path; see the repository [README](../README.md#experimental-adapter-path) and [advanced reference](../README_ADVANCED.md#animaartistadaptermixer-experimental-cross-attention-decoupled) for the complete Adapter workflow and parameter contract.
+
 ## Introduction
 
-This is a ComfyUI custom node that provides **multi-artist mixing** for the Anima model. It hooks into the cross-attention layers and combines multiple artist conditionings with controllable strategies, sidestepping the interference that LLM-based text encoders suffer from when multiple artist tags coexist in a single prompt.
+This is a ComfyUI custom node that provides **multi-artist mixing** for the Anima model. It offers an established cross-attention output path and an experimental post-LLMAdapter embedding path, sidestepping the interference that LLM-based text encoders suffer from when multiple artist tags coexist in a single prompt.
 
 The companion `AnimaArtistPack` node provides a one-shot experience: write your artist list in one text box (comma or newline separated) and your main prompt in another. The node automatically splits, encodes, and packages everything for downstream use.
 
-This README documents the **v24 architecture**, which adds layered cross-seed stabilization (EMA / SVD / static-capture / anchor-Q), CFG-style strength extrapolation, and a new linear injection-layer weight syntax `::name::weight`. Older versions are still functionally a subset.
+This guide primarily documents the established Cross-Attn architecture and its layered cross-seed stabilization (EMA / SVD / static-capture / anchor-Q), CFG-style strength extrapolation, and linear injection-layer weight syntax `::name::weight`. The 26.8.1 Adapter path is summarized above and documented fully in the repository README files.
 
 ## What problem it solves
 
@@ -482,5 +496,5 @@ Special thanks to **汐浮尘** for co-development, testing, and design contribu
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for the full text.
+Starting with version 26.8.1, this project is licensed under the **GNU General Public License v3.0**. See [LICENSE](../LICENSE) for the complete terms. Versions published before 26.8.1 remain under the MIT License included with those historical releases.
 

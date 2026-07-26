@@ -2,6 +2,7 @@
 
 try:
     from .anima_mixer import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+    from .anima_mixer.nodes_embedding import AnimaArtistAdapterMixer
     from .anima_mixer.nodes_core import AnimaArtistCrossAttn, AnimaArtistPack
     from .anima_mixer.nodes_ui import (
         AnimaArtistOptions,
@@ -10,6 +11,7 @@ try:
     )
 except ImportError:
     from anima_mixer import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+    from anima_mixer.nodes_embedding import AnimaArtistAdapterMixer
     from anima_mixer.nodes_core import AnimaArtistCrossAttn, AnimaArtistPack
     from anima_mixer.nodes_ui import (
         AnimaArtistOptions,
@@ -22,6 +24,7 @@ __all__ = [
     "NODE_DISPLAY_NAME_MAPPINGS",
     "AnimaArtistPack",
     "AnimaArtistCrossAttn",
+    "AnimaArtistAdapterMixer",
     "AnimaArtistOptions",
     "AnimaArtistStructureOptions",
     "AnimaArtistStyleBalance",

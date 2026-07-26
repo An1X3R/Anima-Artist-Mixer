@@ -1,15 +1,27 @@
 """Anchor-Q pre-run and sigma capture helpers."""
 
 import logging
+import math
 
 import torch
 
-from .constants import ANCHOR_SEEDS_MAX, ANCHOR_SEEDS_POOL
+from .constants import (
+    ANCHOR_CACHE_POINTS_DEFAULT,
+    ANCHOR_CACHE_POINTS_MAX,
+    ANCHOR_CACHE_POINTS_MIN,
+    ANCHOR_KEYFRAME_ADAPTIVE_Q,
+    ANCHOR_KEYFRAME_MODES,
+    ANCHOR_KEYFRAME_UNIFORM_SIGMA,
+    ANCHOR_REFRESH_WARM_CACHE,
+    ANCHOR_SEEDS_MAX,
+    ANCHOR_SEEDS_POOL,
+)
 from .patching import (
     context_fingerprint,
     in_stabilizer_window,
     reset_run_state,
     should_reraise,
+    tensor_cache_signature,
 )
 
 logger = logging.getLogger(__name__)
@@ -29,6 +41,401 @@ def _condition_row_index(row_count, cond_or_uncond, condition_index):
     return condition_index if condition_index < row_count else 0
 
 
+def _resolve_anchor_seeds(state):
+    manual_anchor_seeds = list(state.get("anchor_seed_list") or [])
+    if manual_anchor_seeds:
+        return manual_anchor_seeds[:ANCHOR_SEEDS_MAX]
+    seeds_count = max(
+        1,
+        min(int(state.get("anchor_seeds_count", 1)), ANCHOR_SEEDS_MAX),
+    )
+    return ANCHOR_SEEDS_POOL[:seeds_count]
+
+
+def _resolve_keyframe_mode(state):
+    mode = str(state.get(
+        "anchor_keyframe_mode",
+        ANCHOR_KEYFRAME_UNIFORM_SIGMA,
+    ))
+    return mode if mode in ANCHOR_KEYFRAME_MODES else ANCHOR_KEYFRAME_UNIFORM_SIGMA
+
+
+def _context_signature(state, context):
+    if state.get("_identity_context_signature", False):
+        entry = state.get("_mixed_context_cache")
+        if isinstance(entry, dict) and entry.get("mixed") is context:
+            return (
+                "adapter_mixed",
+                entry.get("key"),
+                tensor_cache_signature(context),
+            )
+        return ("adapter_context", tensor_cache_signature(context))
+    return context_fingerprint(context)
+
+
+def _trajectory_signature(state, user_x, c_dict):
+    context = _get_crossattn_context(c_dict)
+    if context is None:
+        return None
+    min_sigma = state.get("stabilizer_min_sigma")
+    return (
+        tuple(user_x.shape),
+        str(user_x.dtype),
+        _context_signature(state, context),
+        tuple(_resolve_anchor_seeds(state)),
+        int(state.get("anchor_cache_points", ANCHOR_CACHE_POINTS_DEFAULT)),
+        _resolve_keyframe_mode(state),
+        int(state.get("anchor_deep_layer_threshold", -1)),
+        None if min_sigma is None else round(float(min_sigma), 6),
+    )
+
+
+def _new_anchor_trajectory(state, signature, start_sigma):
+    points = max(
+        ANCHOR_CACHE_POINTS_MIN,
+        min(
+            int(state.get("anchor_cache_points", ANCHOR_CACHE_POINTS_DEFAULT)),
+            ANCHOR_CACHE_POINTS_MAX,
+        ),
+    )
+    end_sigma = state.get("stabilizer_min_sigma")
+    end_sigma = 0.0 if end_sigma is None else float(end_sigma)
+    end_sigma = min(float(start_sigma), max(0.0, end_sigma))
+    targets = [
+        float(start_sigma) + (end_sigma - float(start_sigma)) * index / (points - 1)
+        for index in range(points)
+    ]
+    return {
+        "signature": signature,
+        "keyframe_mode": _resolve_keyframe_mode(state),
+        "points": points,
+        "ready": False,
+        "frames": [],
+        "targets": targets,
+        "next_target_index": 1,
+        "last_sigma": None,
+        "last_cache": None,
+        "bytes": 0,
+        "observed_frames": 0,
+        "pruned_frames": 0,
+        "active_sigma": None,
+        "active_device": None,
+        "active_dtype": None,
+    }
+
+
+def _copy_anchor_cache_to_cpu(state, cache):
+    threshold = int(state.get("anchor_deep_layer_threshold", -1))
+    output = {}
+    for layer_index, hidden in cache.items():
+        if threshold >= 0 and int(layer_index) >= threshold:
+            continue
+        if not torch.is_tensor(hidden):
+            continue
+        output[int(layer_index)] = hidden.detach().to(
+            device="cpu",
+            copy=True,
+        ).contiguous()
+    return output
+
+
+def _frame_bytes(layers):
+    return sum(
+        int(hidden.numel()) * int(hidden.element_size())
+        for hidden in layers.values()
+    )
+
+
+def _cache_sketch(cache, values_per_layer=256):
+    pieces = []
+    for layer_index in sorted(cache):
+        flat = cache[layer_index].reshape(-1)
+        count = min(int(values_per_layer), int(flat.numel()))
+        if count <= 0:
+            continue
+        if count == 1:
+            sample = flat[:1]
+        else:
+            positions = torch.linspace(
+                0,
+                int(flat.numel()) - 1,
+                steps=count,
+                device=flat.device,
+            ).round().to(torch.long)
+            sample = flat.index_select(0, positions)
+        pieces.append(sample.to(dtype=torch.float32))
+    return torch.cat(pieces) if pieces else torch.empty(0, dtype=torch.float32)
+
+
+def _adaptive_frame_error(left, middle, right):
+    low_sigma = float(left["sigma"])
+    mid_sigma = float(middle["sigma"])
+    high_sigma = float(right["sigma"])
+    span = high_sigma - low_sigma
+    if span <= 1e-12:
+        return 0.0
+
+    low = left.get("sketch")
+    mid = middle.get("sketch")
+    high = right.get("sketch")
+    if not all(torch.is_tensor(value) for value in (low, mid, high)):
+        return 0.0
+    count = min(int(low.numel()), int(mid.numel()), int(high.numel()))
+    if count <= 0:
+        return 0.0
+
+    blend = max(0.0, min(1.0, (mid_sigma - low_sigma) / span))
+    predicted = low[:count] * (1.0 - blend) + high[:count] * blend
+    residual = mid[:count] - predicted
+    scale = mid[:count].square().mean() + predicted.square().mean()
+    error = float((residual.square().mean() / scale.clamp_min(1e-12)).item())
+    return error if math.isfinite(error) else float("inf")
+
+
+def _prune_adaptive_frames(trajectory):
+    frames = trajectory["frames"]
+    points = int(trajectory.get("points", ANCHOR_CACHE_POINTS_DEFAULT))
+    while len(frames) > points and len(frames) > 2:
+        total_span = max(
+            1e-12,
+            float(frames[-1]["sigma"]) - float(frames[0]["sigma"]),
+        )
+        candidates = []
+        for index in range(1, len(frames) - 1):
+            left, middle, right = frames[index - 1:index + 2]
+            error = _adaptive_frame_error(left, middle, right)
+            left_gap = float(middle["sigma"]) - float(left["sigma"])
+            right_gap = float(right["sigma"]) - float(middle["sigma"])
+            coverage = max(0.0, left_gap * right_gap) / (total_span * total_span)
+            candidates.append((round(error, 8), coverage, -index, index))
+        remove_index = min(candidates)[-1]
+        removed = frames.pop(remove_index)
+        trajectory["bytes"] -= int(removed.get("bytes", 0))
+        trajectory["pruned_frames"] += 1
+
+
+def _store_trajectory_frame(state, trajectory, sigma, cache):
+    sigma = float(sigma)
+    if any(abs(float(frame["sigma"]) - sigma) <= 1e-6 for frame in trajectory["frames"]):
+        return False
+    cpu_cache = _copy_anchor_cache_to_cpu(state, cache)
+    if not cpu_cache:
+        return False
+    byte_count = _frame_bytes(cpu_cache)
+    frame = {
+        "sigma": sigma,
+        "layers": cpu_cache,
+        "bytes": byte_count,
+    }
+    if trajectory.get("keyframe_mode") == ANCHOR_KEYFRAME_ADAPTIVE_Q:
+        frame["sketch"] = _cache_sketch(cpu_cache)
+    trajectory["frames"].append(frame)
+    trajectory["frames"].sort(key=lambda frame: float(frame["sigma"]))
+    trajectory["bytes"] += byte_count
+    trajectory["observed_frames"] += 1
+    if trajectory.get("keyframe_mode") == ANCHOR_KEYFRAME_ADAPTIVE_Q:
+        _prune_adaptive_frames(trajectory)
+    return True
+
+
+def _record_trajectory_step(state, trajectory, sigma):
+    cache = state.get("_anchor_cache") or {}
+    if not cache:
+        return
+
+    sigma = float(sigma)
+    trajectory["last_sigma"] = sigma
+    trajectory["last_cache"] = cache
+    if trajectory.get("keyframe_mode") == ANCHOR_KEYFRAME_ADAPTIVE_Q:
+        _store_trajectory_frame(state, trajectory, sigma, cache)
+        return
+    if not trajectory["frames"]:
+        _store_trajectory_frame(state, trajectory, sigma, cache)
+        return
+
+    targets = trajectory["targets"]
+    next_index = int(trajectory["next_target_index"])
+    crossed_target = False
+    while next_index < len(targets) - 1 and sigma <= float(targets[next_index]) + 1e-6:
+        crossed_target = True
+        next_index += 1
+    trajectory["next_target_index"] = next_index
+    if crossed_target:
+        _store_trajectory_frame(state, trajectory, sigma, cache)
+
+
+def _finalize_anchor_trajectory(state):
+    trajectory = state.get("_anchor_trajectory")
+    if not trajectory or trajectory.get("ready", False):
+        return
+
+    last_cache = trajectory.get("last_cache") or {}
+    last_sigma = trajectory.get("last_sigma")
+    if last_cache and last_sigma is not None:
+        _store_trajectory_frame(state, trajectory, last_sigma, last_cache)
+    trajectory["last_cache"] = None
+
+    if trajectory.get("keyframe_mode") == ANCHOR_KEYFRAME_ADAPTIVE_Q:
+        targets_complete = True
+    else:
+        targets_complete = int(trajectory.get("next_target_index", 0)) >= max(
+            1,
+            len(trajectory.get("targets") or []) - 1,
+        )
+    if len(trajectory["frames"]) < 2 or not targets_complete:
+        logger.warning(
+            "[%s] warm-cache run ended before enough sigma keyframes were "
+            "captured; the partial cache is discarded.",
+            state.get("anchor_log_name", "AnimaCrossAttn"),
+        )
+        state["_anchor_trajectory"] = None
+        state["_anchor_cache"] = {}
+        state["_anchor_cache_key"] = None
+        return
+
+    trajectory["ready"] = True
+    trajectory["active_sigma"] = None
+    trajectory["active_device"] = None
+    trajectory["active_dtype"] = None
+    for frame in trajectory["frames"]:
+        frame.pop("sketch", None)
+        frame.pop("bytes", None)
+    state["_anchor_cache"] = {}
+    state["_anchor_cache_key"] = None
+    logger.info(
+        "[%s] warm-cache ready: %d sigma keyframes (%s, %d observed), "
+        "%.2f GiB CPU RAM. "
+        "Later sampler seeds reuse it without anchor model passes.",
+        state.get("anchor_log_name", "AnimaCrossAttn"),
+        len(trajectory["frames"]),
+        trajectory.get("keyframe_mode", ANCHOR_KEYFRAME_UNIFORM_SIGMA),
+        int(trajectory.get("observed_frames", 0)),
+        float(trajectory["bytes"]) / (1024.0 ** 3),
+    )
+
+
+def _ensure_anchor_trajectory(state, signature, sigma):
+    trajectory = state.get("_anchor_trajectory")
+    if trajectory is None or trajectory.get("signature") != signature:
+        if trajectory is not None and not state.get("_warned_trajectory_invalidated", False):
+            logger.info(
+                "[%s] warm-cache inputs changed; rebuilding the anchor trajectory.",
+                state.get("anchor_log_name", "AnimaCrossAttn"),
+            )
+            state["_warned_trajectory_invalidated"] = True
+        trajectory = _new_anchor_trajectory(state, signature, sigma)
+        state["_anchor_trajectory"] = trajectory
+        state["_anchor_cache"] = {}
+        state["_anchor_cache_key"] = None
+    return trajectory
+
+
+def _load_anchor_trajectory(state, trajectory, sigma, user_x):
+    frames = trajectory.get("frames") or []
+    if not frames:
+        return False
+
+    sigma = float(sigma)
+    device_key = (user_x.device.type, user_x.device.index)
+    dtype_key = str(user_x.dtype)
+    if (
+        trajectory.get("active_sigma") is not None
+        and abs(float(trajectory["active_sigma"]) - sigma) <= 1e-6
+        and trajectory.get("active_device") == device_key
+        and trajectory.get("active_dtype") == dtype_key
+        and state.get("_anchor_cache")
+    ):
+        return True
+
+    lower = frames[0]
+    upper = frames[-1]
+    if sigma <= float(frames[0]["sigma"]):
+        lower = upper = frames[0]
+    elif sigma >= float(frames[-1]["sigma"]):
+        lower = upper = frames[-1]
+    else:
+        for left, right in zip(frames, frames[1:]):
+            if float(left["sigma"]) <= sigma <= float(right["sigma"]):
+                lower, upper = left, right
+                break
+
+    low_sigma = float(lower["sigma"])
+    high_sigma = float(upper["sigma"])
+    if lower is upper or abs(high_sigma - low_sigma) <= 1e-12:
+        blend = 0.0
+    else:
+        blend = max(0.0, min(1.0, (sigma - low_sigma) / (high_sigma - low_sigma)))
+
+    layer_indices = sorted(
+        set(lower["layers"]).intersection(upper["layers"])
+    )
+    loaded = {}
+    for layer_index in layer_indices:
+        low = lower["layers"][layer_index]
+        if blend <= 1e-6:
+            hidden = low.to(device=user_x.device, dtype=user_x.dtype)
+        elif blend >= 1.0 - 1e-6:
+            hidden = upper["layers"][layer_index].to(
+                device=user_x.device,
+                dtype=user_x.dtype,
+            )
+        else:
+            hidden = low.to(
+                device=user_x.device,
+                dtype=user_x.dtype,
+                copy=True,
+            )
+            high = upper["layers"][layer_index].to(
+                device=user_x.device,
+                dtype=user_x.dtype,
+            )
+            hidden.mul_(1.0 - blend).add_(high, alpha=blend)
+        loaded[layer_index] = hidden
+
+    if not loaded:
+        return False
+    state["_anchor_cache"] = loaded
+    state["_anchor_cache_key"] = (
+        "warm_cache",
+        trajectory["signature"],
+        round(sigma, 6),
+    )
+    trajectory["active_sigma"] = sigma
+    trajectory["active_device"] = device_key
+    trajectory["active_dtype"] = dtype_key
+    if not state.get("_warned_trajectory_reuse", False):
+        logger.info(
+            "[%s] reusing the warmed Anchor-Q trajectory; no anchor model "
+            "passes are needed for this run.",
+            state.get("anchor_log_name", "AnimaCrossAttn"),
+        )
+        state["_warned_trajectory_reuse"] = True
+    return True
+
+
+def _run_or_load_warm_anchor(state, user_x, user_timestep, c_dict, apply_model, sigma):
+    signature = _trajectory_signature(state, user_x, c_dict)
+    if signature is None:
+        return
+    trajectory = _ensure_anchor_trajectory(state, signature, sigma)
+    if trajectory.get("ready", False):
+        _load_anchor_trajectory(state, trajectory, sigma, user_x)
+        return
+
+    # The previous GPU snapshot is only needed if the run ends here. Release it
+    # before capturing the next sigma so warmup does not retain two full Q sets.
+    trajectory["last_cache"] = None
+    maybe_run_anchor(
+        state,
+        user_x,
+        user_timestep,
+        c_dict,
+        apply_model=apply_model,
+    )
+    if not state.get("_anchor_failed", False):
+        _record_trajectory_step(state, trajectory, sigma)
+
+
 def make_sigma_capture(state, prev_wrapper):
     def wrapper(apply_model, options):
         ts = options.get("timestep")
@@ -41,28 +448,46 @@ def make_sigma_capture(state, prev_wrapper):
                 pass
 
         prev_run_sigma = state.get("_run_last_sigma")
-        if prev_run_sigma is None or (
+        is_run_start = prev_run_sigma is None or (
             cur_sigma is not None and cur_sigma > prev_run_sigma + 1e-3
+        )
+        refresh_mode = str(state.get("anchor_refresh_mode", "once"))
+        if (
+            is_run_start
+            and prev_run_sigma is not None
+            and refresh_mode == ANCHOR_REFRESH_WARM_CACHE
         ):
+            _finalize_anchor_trajectory(state)
+        if is_run_start:
             reset_run_state(state)
         state["_run_last_sigma"] = cur_sigma
 
         if (
             state.get("artist_anchor_q", False)
             and not state.get("_anchor_failed", False)
+            and not state.get("_embedding_mixer_failed", False)
             and in_stabilizer_window(state)
         ):
             prev_anchor_sigma = state.get("_anchor_last_sigma")
-            is_run_start = (
+            is_anchor_start = (
                 prev_anchor_sigma is None
                 or (cur_sigma is not None and cur_sigma > prev_anchor_sigma + 1e-3)
             )
             state["_anchor_last_sigma"] = cur_sigma
-            if is_run_start or not state.get("_anchor_cache"):
-                user_x = options.get("input")
-                user_ts = options.get("timestep")
-                c_dict = options.get("c", {}) or {}
-                if user_x is not None and user_ts is not None and c_dict:
+            user_x = options.get("input")
+            user_ts = options.get("timestep")
+            c_dict = options.get("c", {}) or {}
+            if user_x is not None and user_ts is not None and c_dict:
+                if refresh_mode == ANCHOR_REFRESH_WARM_CACHE and cur_sigma is not None:
+                    _run_or_load_warm_anchor(
+                        state,
+                        user_x,
+                        user_ts,
+                        c_dict,
+                        apply_model,
+                        cur_sigma,
+                    )
+                elif is_anchor_start or not state.get("_anchor_cache"):
                     maybe_run_anchor(state, user_x, user_ts, c_dict, apply_model=apply_model)
 
         if prev_wrapper is not None:
@@ -72,6 +497,7 @@ def make_sigma_capture(state, prev_wrapper):
 
 
 def maybe_run_anchor(state, user_x, user_timestep, c_dict, apply_model=None):
+    log_name = str(state.get("anchor_log_name", "AnimaCrossAttn"))
     base_context = _get_crossattn_context(c_dict)
     if base_context is None:
         return
@@ -93,15 +519,10 @@ def maybe_run_anchor(state, user_x, user_timestep, c_dict, apply_model=None):
         sigma_key = round(float(user_timestep.flatten()[0].item()), 4)
     except Exception:
         sigma_key = None
-    manual_anchor_seeds = list(state.get("anchor_seed_list") or [])
-    if manual_anchor_seeds:
-        anchor_seeds = manual_anchor_seeds[:ANCHOR_SEEDS_MAX]
-    else:
-        seeds_count = max(1, min(int(state.get("anchor_seeds_count", 1)), ANCHOR_SEEDS_MAX))
-        anchor_seeds = ANCHOR_SEEDS_POOL[:seeds_count]
+    anchor_seeds = _resolve_anchor_seeds(state)
     new_key = (
         tuple(user_x.shape),
-        context_fingerprint(original_context),
+        _context_signature(state, original_context),
         sigma_key,
         tuple(anchor_seeds),
     )
@@ -168,9 +589,19 @@ def maybe_run_anchor(state, user_x, user_timestep, c_dict, apply_model=None):
                     kwargs["transformer_options"] = safe_opts
                     apply_model(anchor_x, user_timestep, **kwargs)
                 elif hasattr(dm, "_forward"):
-                    dm._forward(anchor_x, user_timestep, processed_ctx, transformer_options=safe_opts)
+                    dm._forward(
+                        anchor_x,
+                        user_timestep,
+                        processed_ctx,
+                        transformer_options=safe_opts,
+                    )
                 else:
-                    dm(anchor_x, user_timestep, processed_ctx, transformer_options=safe_opts)
+                    dm(
+                        anchor_x,
+                        user_timestep,
+                        processed_ctx,
+                        transformer_options=safe_opts,
+                    )
 
                 for layer_idx, hidden in state["_anchor_cache"].items():
                     if layer_idx not in accumulator:
@@ -186,7 +617,9 @@ def maybe_run_anchor(state, user_x, user_timestep, c_dict, apply_model=None):
         if should_reraise(e):
             raise
         logger.warning(
-            "[AnimaCrossAttn] anchor pre-run failed; anchor_q is disabled: %s", e,
+            "[%s] anchor pre-run failed; anchor_q is disabled: %s",
+            log_name,
+            e,
         )
         state["_anchor_cache"] = {}
         state["_anchor_failed"] = True
@@ -197,7 +630,8 @@ def maybe_run_anchor(state, user_x, user_timestep, c_dict, apply_model=None):
         state["_anchor_cache_key"] = new_key
         if not state.get("_warned_anchor_ok", False):
             logger.info(
-                "[AnimaCrossAttn] anchor pre-run captured %d layers of hidden state",
+                "[%s] anchor pre-run captured %d layers of hidden state",
+                log_name,
                 len(state["_anchor_cache"]),
             )
             state["_warned_anchor_ok"] = True
@@ -205,7 +639,8 @@ def maybe_run_anchor(state, user_x, user_timestep, c_dict, apply_model=None):
         state["_anchor_failed"] = True
         if not state.get("_warned_anchor_empty", False):
             logger.warning(
-                "[AnimaCrossAttn] anchor pre-run captured no hidden states; "
-                "anchor_q is disabled for this run."
+                "[%s] anchor pre-run captured no hidden states; anchor_q is "
+                "disabled for this run.",
+                log_name,
             )
             state["_warned_anchor_empty"] = True

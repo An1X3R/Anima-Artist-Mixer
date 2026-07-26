@@ -200,6 +200,9 @@ class AnimaArtistCrossAttn:
         anchor_seed_list = parse_anchor_seed_list(
             adv.get("anchor_seed_list", ""), ANCHOR_SEEDS_MAX
         )
+        anchor_seed_list_is_manual = bool(
+            adv.get("anchor_seed_list_is_manual", bool(anchor_seed_list))
+        )
         anchor_seeds_count = int(adv.get("anchor_seeds_count", 1))
         anchor_seeds_count = max(1, min(anchor_seeds_count, ANCHOR_SEEDS_MAX))
         anchor_user_blend = max(0.0, min(1.0, float(adv.get("anchor_user_blend", 0.0))))
@@ -316,7 +319,7 @@ class AnimaArtistCrossAttn:
                 "uncond_strength=%.2f; uncond rows receive partial artist injection.",
                 uncond_strength,
             )
-        if artist_anchor_q and anchor_seed_list:
+        if artist_anchor_q and anchor_seed_list_is_manual and anchor_seed_list:
             logger.info(
                 "[AnimaCrossAttn] using manual anchor_seed_list=%s; "
                 "anchor_seeds_count is ignored.",
@@ -458,6 +461,21 @@ class AnimaArtistCrossAttn:
         m.set_model_unet_function_wrapper(make_sigma_capture(state, prev))
 
         existing_patches = getattr(m, "object_patches", None) or {}
+        adapter_anchor_overlap = [
+            i for i in target_blocks
+            if getattr(
+                existing_patches.get(
+                    f"diffusion_model.blocks.{i}.cross_attn.forward"
+                ),
+                "_anima_adapter_anchor_q_forward_patch",
+                False,
+            )
+        ]
+        if adapter_anchor_overlap:
+            raise ValueError(
+                "[AnimaCrossAttn] the input model already uses Adapter Q-only "
+                "Anchor. Do not chain the full Cross-Attn Mixer after it."
+            )
         overlapped = [
             i for i in target_blocks
             if f"diffusion_model.blocks.{i}.cross_attn.forward" in existing_patches

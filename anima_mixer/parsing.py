@@ -163,7 +163,7 @@ def parse_anchor_seed_list(text, max_count):
             continue
         if seed < 0:
             continue
-        seed = seed % (2 ** 63)
+        seed = seed % (2 ** 64)
         if seed in seen:
             continue
         seen.add(seed)

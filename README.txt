@@ -1,5 +1,5 @@
 This plugin solves the problem of Anima not handling artist chains well.
-This plugin provides three nodes: Anima Cross Attn / Anima Artist Pack / Anima Artist Options(Advanced)
+This plugin provides the established Cross-Attn path plus an experimental post-adapter path.
 
 Anima Artist Pack
 Node for inputting artist chain and prompt, here referred to as artist and base_prompt
@@ -40,10 +40,40 @@ It has two output ports: a model output and a base_prompt output
 	0.0=no uncond injection, 0.15~0.35=weak influence, 1.0=old full-uncond behavior
 7. Output wiring: the model output goes directly into KSampler; base_prompt goes to KSampler's positive (positive conditioning)
 
+Anima Artist Adapter Mixer (Experimental)
+An alternative to Anima Artist Cross-Attn. Do not connect both in series.
+1. Mixes LLMAdapter output embeddings once at the model boundary instead of patching every cross-attention layer
+2. Formula: mixed = base + strength * perpendicular(weighted_artists - base, base)
+3. base_anchored is the default alignment mode
+	Each artist keeps its complete Qwen source, own T5 target IDs, and own T5 weights through LLMAdapter
+	After Adapter, matching base T5 tokens share anchor rows and every unmatched artist token gets a gap row
+	Exact suffix matching is preferred; LCS is only a tokenizer-boundary fallback
+	No real base or artist token row is pooled or truncated
+4. shared_base_ids is retained as the older A/B mode
+	It uses the base T5 target grid for every artist, replacing each artist's original target sequence
+5. Alignment is guided by T5 IDs after Adapter; Qwen embeddings are not padded by this plugin
+6. base_anchored keeps uncond rows unchanged because negative T5 IDs are unavailable for honest alignment
+7. Optional Q-only Anchor:
+	Connect Anima Artist Options(Advanced) to the Adapter Mixer's advanced_options input
+	Enable artist_anchor_q and enter fixed manual anchor_seed_list values such as 42,12345
+	Selected seeds are averaged and the anchor pre-run uses the mixed post-Adapter context
+	anchor_user_blend, anchor_deep_layer_threshold, stabilizer_end_percent, anchor_refresh_mode, anchor_cache_points, and anchor_keyframe_mode also apply
+	An empty seed list is rejected because it changes the anchor between executions
+	Q-only Anchor changes cond Q but does not run the old per-artist attention mixer again
+8. Anchor refresh modes:
+	once is the default and reuses one start-sigma Q snapshot
+	warm_cache runs anchor passes across the first complete sampling run, stores averaged CPU Q keyframes, and reuses them for later KSampler seeds
+	anchor_cache_points controls retained keyframes; default 8, range 2~12
+	anchor_keyframe_mode=uniform_sigma keeps evenly spaced sigma frames
+	anchor_keyframe_mode=adaptive_q keeps the bounded frames with the largest sampled Q-trajectory interpolation error; first warmup uses more CPU transfer
+	The warm cache is session-only and rebuilds when context, shape, seeds, or relevant settings change
+9. Layer/step ranges, EMA, lowrank_avg, static capture, Structure Guard, and Style Balance remain Cross-Attn-only
+10. Output wiring is the same as Cross-Attn: model to KSampler model, base_prompt to positive
+
 Anima Artist Options(Advanced)
 Provides advanced settings for users
 1. This node outputs advanced_options plus anchor_seeds_used
-	advanced_options connects to Anima Artist Cross-Attn's optional input
+	advanced_options connects to Anima Artist Cross-Attn or Anima Artist Adapter Mixer
 	anchor_seeds_used is a text list of the seeds used by anchor_q
 2. Basic settings: layer range, sampling-progress range, normalize toggle, layer_filter (custom layer selection)
 3. Stability-related parameters (for resolving multi-artist cross-seed style drift):
@@ -56,6 +86,9 @@ Provides advanced settings for users
 	anchor_seeds_count           number of anchor seeds, default 1, range 1~4
 	anchor_user_blend            anchor / user-x blend ratio, 0=pure anchor, 1=pure user x
 	anchor_deep_layer_threshold  shallow layers use anchor for stable style, deep layers use user x for fine brushwork, -1=disabled
+	anchor_refresh_mode          [Adapter Mixer only] once=single snapshot, warm_cache=session reuse
+	anchor_cache_points          [Adapter Mixer only] warm_cache CPU keyframes, default 8, range 2~12
+	anchor_keyframe_mode         [Adapter Mixer only] uniform_sigma or bounded adaptive_q selection
 4. Stability tools are usually enabled progressively from light to heavy: try ema first → if not enough, switch to lowrank_avg → still not enough, enable static_capture → still not enough, enable anchor_q
 5. Layer range can shorten generation time, but with some quality impact, advanced users can tune it themselves
 
@@ -72,3 +105,7 @@ Optional helper node for reducing seed-to-seed artist dominance drift
 2. style_balance matches each artist's output volume before user weights are applied
 3. ::artist::weight still works normally after style_balance
 4. Try 0.25~0.35 for light stabilization, 0.45~0.60 for stronger stabilization
+
+License
+Starting with version 26.8.1, this project is licensed under GNU General Public License v3.0.
+Versions published before 26.8.1 remain under their original MIT License.

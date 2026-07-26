@@ -2,11 +2,17 @@
 
 ## Introduction
 
-This is a ComfyUI custom node that provides **multi-artist mixing** for the Anima model. It hooks into the cross-attention layers and combines multiple artist conditionings with controllable strategies, sidestepping the interference that LLM-based text encoders suffer from when multiple artist tags coexist in a single prompt.
+This is a ComfyUI custom node that provides **multi-artist mixing** for the Anima model. It offers an established cross-attention output path and an experimental post-LLMAdapter embedding path, sidestepping the interference that LLM-based text encoders suffer from when multiple artist tags coexist in a single prompt.
 
 The companion `AnimaArtistPack` node provides a one-shot experience: write your artist list in one text box (comma or newline separated) and your main prompt in another. The node automatically splits, encodes, and packages everything for downstream use.
 
 This README documents the current split-module architecture, including layered cross-seed stabilization (EMA / lowrank / static-capture / anchor-Q), CFG-style strength extrapolation, linear injection-layer weight syntax, and the optional Structure Guard helper.
+
+## 26.8.1 Headline: Post-Adapter Mixer
+
+`AnimaArtistAdapterMixer` is the major new experimental path. It mixes post-LLMAdapter context once at the model boundary, uses information-preserving `base_anchored` token-row alignment by default, and leaves individual cross-attention layers untouched unless optional Q-only Anchor is enabled. In current Anima testing it approached twice the throughput of the established per-layer artist-output path while retaining similar visual quality; results vary by workflow and hardware.
+
+The Adapter Mixer and `AnimaArtistCrossAttn` are alternative algorithms. Do not chain them. See [AnimaArtistAdapterMixer](#animaartistadaptermixer-experimental-cross-attention-decoupled) for the full contract, mathematical limits, accepted advanced parameters, manual Anchor seeds, warm-cache behavior, and adaptive Q keyframes.
 
 ## What problem it solves
 
@@ -28,7 +34,7 @@ Prompt
   → LLM encoder (Qwen, etc.)
   → raw embedding (1, T, 1024)
   → LLMAdapter (6-layer transformer, adapts LLM output to DiT's expected distribution)
-  → processed (1, 512, 1024), padded to fixed length 512
+  → processed (1, max(T5 tokens, 512), 1024), right-padded to at least 512
   → consumed as K/V by every DiT block's cross-attention
 ```
 
@@ -36,9 +42,9 @@ The DiT backbone has 28 blocks total, each with its own independent cross-attent
 
 ### Injection mechanism
 
-The node replaces `diffusion_model.blocks[i].cross_attn` with a wrapper using ComfyUI's `add_object_patch` API. This is clone-safe — it doesn't pollute the original model and is automatically undone when the workflow disconnects.
+The node patches only `diffusion_model.blocks[i].cross_attn.forward` using ComfyUI's `add_object_patch` API. The original attention module stays in the model tree, so weight paths remain unchanged and ComfyUI can restore or unload the model normally.
 
-Each artist conditioning is lazily run through the LLMAdapter on its first forward call (when the model is already on GPU), producing a `(1, 512, 1024)` processed embedding that's cached for reuse across sampling steps.
+Each artist conditioning is lazily run through the LLMAdapter on its first forward call (when the model is already on GPU), producing a processed embedding that's cached for reuse across sampling steps. Anima right-pads outputs shorter than 512 rows but does not truncate outputs longer than 512.
 
 Each layer's injection is wrapped in exception isolation: if a single layer's injection fails, only that layer falls back to the original cross-attention; other layers continue working normally.
 
@@ -107,6 +113,17 @@ Restart ComfyUI. No extra dependencies.
 (optional) AnimaArtistOptions ──► advanced_options ──► AnimaArtistCrossAttn
 ```
 
+Experimental decoupled alternative:
+
+```
+                          ┌──► artist_pack ──► AnimaArtistAdapterMixer ──► MODEL ──► KSampler
+[Load CLIP] ─► CLIP ──────┤                                  │
+                          │                                  └──► base_prompt ──► (positive)
+                          └──► CLIPTextEncode (Negative) ──► (negative)
+
+[Load Anima Model] ──► MODEL ──► AnimaArtistAdapterMixer
+```
+
 Key points:
 - Write your artist chain in `AnimaArtistPack`'s top text box (comma or newline separated)
 - Write your main prompt in the bottom text box
@@ -146,13 +163,66 @@ Outputs:
 - `model`: model with artist mixing patched in. Connect to KSampler's `model` input
 - `base_prompt`: the bare base-prompt conditioning from `artist_pack`. Connect to KSampler's positive input
 
+### AnimaArtistAdapterMixer (experimental, cross-attention-decoupled)
+
+This node is an alternative to `AnimaArtistCrossAttn`, not an add-on. It mixes the post-LLMAdapter context once at the model boundary. Individual `cross_attn.forward` methods remain untouched unless the optional Q-only Anchor is enabled.
+
+For post-adapter base embedding `B` and artist embeddings `A_i`, it applies the projection independently to every token row:
+
+```
+C = B + strength * proj_perpendicular(sum_i(weight_i * A_i) - B, B)
+```
+
+The mixed `C` is then used as the normal model context by every DiT block.
+
+| Parameter | Description |
+|---|---|
+| `model` | Anima model. The node only requires a callable `preprocess_text_embeds` Adapter interface |
+| `artist_pack` | Output from `AnimaArtistPack` |
+| `strength` | Perpendicular artist-delta strength, range 0~4 |
+| `normalize_weights` | Normalize `::weight` values to relative ratios |
+| `alignment_mode` | `base_anchored` (default) or `shared_base_ids` (older A/B mode) |
+| `enabled` | Return the original model unchanged when disabled |
+| `apply_to_uncond` | Also mix artist context into CFG uncond rows |
+| `uncond_strength` | Uncond-side scale when `apply_to_uncond=True` |
+| `advanced_options` | Optional `AnimaArtistOptions` payload. Only Q-only Anchor controls are consumed |
+
+`base_anchored` runs every artist through LLMAdapter with that artist conditioning's complete Qwen source embedding, own `t5xxl_ids`, and own T5 weights. It then uses T5 token IDs to build a common post-Adapter canvas. The full base token sequence is searched inside each artist sequence, preferring an exact suffix/substring match. Matching base tokens share anchor rows. Tokens before, between, or after those anchors are placed in explicit gap rows, so every real Adapter output row is retained exactly once. If tokenization prevents an exact match, a longest-common-subsequence fallback preserves all unmatched rows and reports the reduced match quality in the log.
+
+`shared_base_ids` is retained for controlled comparison. Each artist keeps its separately encoded Qwen source, but every LLMAdapter pass uses the base prompt's T5 IDs and weights. This creates a common grid without scattering, at the cost of replacing the artist conditioning's original target sequence and artist-specific T5 weighting.
+
+Neither mode pads Qwen. The alignment is performed after LLMAdapter and is guided by T5 target IDs. Anima's own minimum-512 zero padding remains, but native padding rows are excluded from token matching. `base_anchored` changes cond rows only: the wrapper does not receive negative-prompt T5 IDs, so applying the same remap to uncond would risk dropping or misaligning negative-prompt semantics.
+
+Q-only Anchor can be enabled by connecting `AnimaArtistOptions`, setting `artist_anchor_q=True`, and entering a fixed manual `anchor_seed_list`. Cross-attention itself has no random generator: each selected seed creates a fixed anchor latent, and multiple seeds are averaged before their per-layer hidden states become Q inputs. The Adapter anchor pre-run receives the same mixed post-Adapter context as the real denoising pass. That mixed context remains the only K/V input, and the old per-artist attention branches are not executed. Q replacement is cond-only; uncond keeps the current sampling hidden state.
+
+The Adapter path reads `anchor_user_blend`, `anchor_deep_layer_threshold`, `stabilizer_end_percent`, `anchor_refresh_mode`, `anchor_cache_points`, and `anchor_keyframe_mode`. It deliberately rejects an empty/non-manual anchor seed because `AnimaArtistOptions` generates fresh random anchors when the field is empty. Start with `anchor_user_blend=0.0`, `anchor_deep_layer_threshold=-1`, and `stabilizer_end_percent=1.0` to measure maximum stability. Then use a higher user blend or a finite deep-layer threshold if composition becomes too constrained.
+
+Adapter Anchor refresh modes:
+
+- `once` (default): capture one start-sigma Q snapshot. It is reused for every later sigma and for later executions while shape, context, and seeds remain unchanged.
+- `warm_cache`: during the first complete sampling run, execute the selected anchor seeds at every active sigma. Average their hidden states immediately, retain only `anchor_cache_points` CPU keyframes, and use sigma interpolation on later runs. Once warm, changing only the KSampler seed performs no anchor model forward. `uniform_sigma` keeps evenly spaced sigma frames. `adaptive_q` scores sampled Q-trajectory interpolation error and continuously prunes to the configured capacity, preserving both endpoints.
+
+The warm cache is owned by the patched model object and lasts for the current ComfyUI session. It is rebuilt when the mixed context, image/batch shape, manual seed list, cache-point count, keyframe mode, deep-layer threshold, or stabilizer range changes. Restarting ComfyUI also clears it. System-RAM usage scales with spatial token count, cached layers, and keyframe count; only the seed average is stored, so adding more reference seeds increases first-run compute but not cache size. A 1024-class, full-layer Anima cache can require several GiB with eight points. `adaptive_q` copies each first-run candidate to CPU for scoring but immediately removes the least useful interior frame, so retained memory stays bounded. Interpolation also introduces small CPU-to-GPU transfer and arithmetic cost, but no additional model pass after warmup.
+
+The Adapter Mixer:
+
+- does not patch individual cross-attention modules unless Q-only Anchor is enabled
+- computes and caches each artist's post-adapter embedding once per device and dtype
+- caches the final projected context by conditioning identity/version and CFG row layout, avoiding per-step projection and GPU value fingerprints
+- preserves every real base and artist token row in `base_anchored`; it performs no pooling
+- preserves pre-existing model wrappers through chain-safe delegation
+- modifies cond rows only by default
+- does not use start/end block ranges, sampling ranges, EMA, low-rank output averaging, static capture, Structure Guard, or Style Balance
+
+Do not connect `AnimaArtistCrossAttn` and `AnimaArtistAdapterMixer` in series. Use separate branches from the same unpatched model for controlled A/B comparisons.
+
 ### AnimaArtistOptions (advanced)
 
 Not connecting this node = default behavior. Connecting it makes its settings take effect.
 
 Outputs:
-- `advanced_options`: connect to `AnimaArtistCrossAttn`
-- `anchor_seeds_used`: text list of the anchor seeds that will be used. If `anchor_seed_list` is empty, this shows the built-in seeds selected by `anchor_seeds_count`; otherwise it shows the parsed manual list
+- `advanced_options`: connect to `AnimaArtistCrossAttn`, or to `AnimaArtistAdapterMixer` for its Q-only Anchor subset
+- `anchor_seeds_used`: text list of the anchor seeds that will be used. The Cross-Attn Mixer can generate fresh seeds when `anchor_seed_list` is empty; Adapter Q-only Anchor requires a manual list
 
 | Parameter | Description |
 |---|---|
@@ -169,6 +239,9 @@ Outputs:
 | `anchor_seeds_count` | Number of anchor seeds to average. Default 1, range 1~4 |
 | `anchor_user_blend` | Blend ratio between anchor Q and user Q. 0 = pure anchor, 1 = pure user |
 | `anchor_deep_layer_threshold` | Use anchor for shallow layers `[0, N)`, user Q for deep layers `[N, end]`. -1 disables |
+| `anchor_refresh_mode` | Adapter Mixer only: `once` or session-level `warm_cache` sigma keyframes |
+| `anchor_cache_points` | Adapter Mixer only: `warm_cache` CPU keyframes. Default 8, range 2~12 |
+| `anchor_keyframe_mode` | Adapter Mixer only: `uniform_sigma` or bounded `adaptive_q` selection for `warm_cache` |
 
 ### Optional Structure Guard
 
@@ -204,6 +277,26 @@ AnimaArtistOptions -> AnimaArtistStyleBalance -> AnimaArtistCrossAttn
 This does not replace injection weights. For example, `1::wlop, 2::sakimichan` still applies a 1:2 user weight ratio after the balance step. Try `0.25~0.35` for light stabilization and `0.45~0.60` for stronger stabilization.
 
 ## Core concepts
+
+### Post-adapter projection versus output projection
+
+The established `base_preserve` path applies perpendicular projection after attention:
+
+```
+base_out   = Attention(Q, base_context)
+artist_out = sum_i(weight_i * Attention(Q, artist_context_i))
+output     = base_out + strength * proj_perpendicular(artist_out - base_out, base_out)
+```
+
+The Adapter Mixer applies the same geometric form before attention:
+
+```
+mixed_context = base_context + strength *
+                proj_perpendicular(artist_context - base_context, base_context)
+output = Attention(Q, mixed_context)
+```
+
+These are deliberately separate algorithms. K/V projection, K normalization, and attention softmax are nonlinear as a whole, so mixing contexts before attention is not mathematically equivalent to mixing outputs after attention. The Adapter path trades that direct output-space control for much lower repeated attention cost and weaker coupling to a particular DiT block layout.
 
 ### combine_mode: how multiple artists are merged
 
@@ -335,7 +428,7 @@ First-time cost: ~1 extra step worth of forward time for the anchor pass. After 
 **Sub-options for finer control**:
 
 - `anchor_seed_list` (optional): manually specify fixed anchor seeds, e.g. `12345,67890`. If filled, this list is used directly and `anchor_seeds_count` is ignored. A single seed can lock the style reference to one selected result.
-- `anchor_seeds_count` (1~4, default 1): when `anchor_seed_list` is empty, runs N anchor passes with different fixed seeds and averages their hidden states. Mitigates the small chance that a single fixed seed produces a systematically biased anchor. Cost scales linearly with N.
+- `anchor_seeds_count` (1~4, default 1): when `anchor_seed_list` is empty, generates N new random seeds per execution, runs N anchor passes, and averages their hidden states. This avoids permanently biasing all runs toward one built-in seed set. Cost scales linearly with N.
 - `anchor_user_blend` (0~1, default 0): blends anchor Q with user Q. 0 = pure anchor (max stability), 1 = pure user (equivalent to disabling anchor). Useful if pure anchor produces brushwork that looks slightly disconnected from the actual content.
 - `anchor_deep_layer_threshold` (-1~64, default -1 = disabled): when set to N, layers `[0, N)` use anchor Q (style stability) while layers `[N, end]` use user Q (content fidelity). Based on the principle that early DiT blocks set style and late blocks add detail.
 
@@ -511,6 +604,12 @@ Implementation detail: the node uses `set_model_unet_function_wrapper` to captur
 
 ## Known issues
 
+### Adapter target-token alignment
+
+`base_anchored` preserves all real rows, but token-ID equality is only a structural alignment cue. LLMAdapter embeddings are contextual: a base token encoded with an artist prefix is not numerically or semantically identical to the same token encoded in the bare base prompt. The perpendicular projection also happens before K/V projection and softmax, so it cannot guarantee output-space orthogonality.
+
+Exact suffix matching is expected for the plugin's normal `<artist>\n<base_prompt>` encoding. If the tokenizer changes boundary tokens, LCS fallback is used and the log reports the match count. Every unmatched row is retained, but weak matching means weaker row-to-row semantic correspondence. `pad_longest` is no longer exposed because equal tensor lengths alone do not align token meaning.
+
 ### `model_function_wrapper` chain conflicts
 
 When sampling-step range or any cross-seed stabilizer is enabled, this node uses `set_model_unet_function_wrapper` to capture per-step sigma. The implementation is chain-safe — it preserves and forwards calls to any pre-existing wrapper.
@@ -525,4 +624,6 @@ Special thanks to **汐浮尘** for co-development, testing, and design contribu
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for the full text.
+Copyright (c) 2026 An1X3R and 汐浮尘.
+
+Starting with version 26.8.1, this project is licensed under the **GNU General Public License v3.0**. See [LICENSE](LICENSE) for the complete terms. Versions published before 26.8.1 remain under the MIT License included with those historical releases.

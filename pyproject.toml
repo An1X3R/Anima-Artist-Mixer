@@ -1,7 +1,7 @@
 [project]
 name = "anima-artist-mixer"
-description = "A ComfyUI custom node that enables multi-artist mixing for the Anima model by hooking into its cross-attention layers."
-version = "26.2.0"
+description = "Multi-artist mixing for Anima through cross-attention or post-adapter embedding projection."
+version = "26.8.1"
 license = { file = "LICENSE" }
 dependencies = []
 readme = "README.md"
