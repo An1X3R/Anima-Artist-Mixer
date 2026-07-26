@@ -8,11 +8,15 @@ The companion `AnimaArtistPack` node provides a one-shot experience: write your 
 
 This README documents the current split-module architecture, including layered cross-seed stabilization (EMA / lowrank / static-capture / anchor-Q), CFG-style strength extrapolation, linear injection-layer weight syntax, and the optional Structure Guard helper.
 
+## 26.8.2 Update: Automatic Adapter Anchor Seeds
+
+Adapter Q-only Anchor now accepts the Options node's automatically generated seeds when `anchor_seed_list` is empty. This restores random style-reference exploration through `anchor_seeds_count`. A fixed list remains the mode for repeatable stabilization and cross-execution `once` or `warm_cache` reuse.
+
 ## 26.8.1 Headline: Post-Adapter Mixer
 
 `AnimaArtistAdapterMixer` is the major new experimental path. It mixes post-LLMAdapter context once at the model boundary, uses information-preserving `base_anchored` token-row alignment by default, and leaves individual cross-attention layers untouched unless optional Q-only Anchor is enabled. In current Anima testing it approached twice the throughput of the established per-layer artist-output path while retaining similar visual quality; results vary by workflow and hardware.
 
-The Adapter Mixer and `AnimaArtistCrossAttn` are alternative algorithms. Do not chain them. See [AnimaArtistAdapterMixer](#animaartistadaptermixer-experimental-cross-attention-decoupled) for the full contract, mathematical limits, accepted advanced parameters, manual Anchor seeds, warm-cache behavior, and adaptive Q keyframes.
+The Adapter Mixer and `AnimaArtistCrossAttn` are alternative algorithms. Do not chain them. See [AnimaArtistAdapterMixer](#animaartistadaptermixer-experimental-cross-attention-decoupled) for the full contract, mathematical limits, accepted advanced parameters, automatic or fixed Anchor seeds, warm-cache behavior, and adaptive Q keyframes.
 
 ## What problem it solves
 
@@ -193,16 +197,16 @@ The mixed `C` is then used as the normal model context by every DiT block.
 
 Neither mode pads Qwen. The alignment is performed after LLMAdapter and is guided by T5 target IDs. Anima's own minimum-512 zero padding remains, but native padding rows are excluded from token matching. `base_anchored` changes cond rows only: the wrapper does not receive negative-prompt T5 IDs, so applying the same remap to uncond would risk dropping or misaligning negative-prompt semantics.
 
-Q-only Anchor can be enabled by connecting `AnimaArtistOptions`, setting `artist_anchor_q=True`, and entering a fixed manual `anchor_seed_list`. Cross-attention itself has no random generator: each selected seed creates a fixed anchor latent, and multiple seeds are averaged before their per-layer hidden states become Q inputs. The Adapter anchor pre-run receives the same mixed post-Adapter context as the real denoising pass. That mixed context remains the only K/V input, and the old per-artist attention branches are not executed. Q replacement is cond-only; uncond keeps the current sampling hidden state.
+Q-only Anchor can be enabled by connecting `AnimaArtistOptions` and setting `artist_anchor_q=True`. Leave `anchor_seed_list` empty to have the Options node generate `anchor_seeds_count` fresh random seeds for that execution, or enter a fixed list for repeatable references. Each selected seed creates a fixed anchor latent, and multiple seeds are averaged before their per-layer hidden states become Q inputs. The Adapter anchor pre-run receives the same mixed post-Adapter context as the real denoising pass. That mixed context remains the only K/V input, and the old per-artist attention branches are not executed. Q replacement is cond-only; uncond keeps the current sampling hidden state.
 
-The Adapter path reads `anchor_user_blend`, `anchor_deep_layer_threshold`, `stabilizer_end_percent`, `anchor_refresh_mode`, `anchor_cache_points`, and `anchor_keyframe_mode`. It deliberately rejects an empty/non-manual anchor seed because `AnimaArtistOptions` generates fresh random anchors when the field is empty. Start with `anchor_user_blend=0.0`, `anchor_deep_layer_threshold=-1`, and `stabilizer_end_percent=1.0` to measure maximum stability. Then use a higher user blend or a finite deep-layer threshold if composition becomes too constrained.
+The Adapter path reads `anchor_user_blend`, `anchor_deep_layer_threshold`, `stabilizer_end_percent`, `anchor_refresh_mode`, `anchor_cache_points`, and `anchor_keyframe_mode`. Automatically generated and fixed seed lists are both accepted. Start with `anchor_user_blend=0.0`, `anchor_deep_layer_threshold=-1`, and `stabilizer_end_percent=1.0` to measure maximum stability. Then use a higher user blend or a finite deep-layer threshold if composition becomes too constrained.
 
 Adapter Anchor refresh modes:
 
 - `once` (default): capture one start-sigma Q snapshot. It is reused for every later sigma and for later executions while shape, context, and seeds remain unchanged.
 - `warm_cache`: during the first complete sampling run, execute the selected anchor seeds at every active sigma. Average their hidden states immediately, retain only `anchor_cache_points` CPU keyframes, and use sigma interpolation on later runs. Once warm, changing only the KSampler seed performs no anchor model forward. `uniform_sigma` keeps evenly spaced sigma frames. `adaptive_q` scores sampled Q-trajectory interpolation error and continuously prunes to the configured capacity, preserving both endpoints.
 
-The warm cache is owned by the patched model object and lasts for the current ComfyUI session. It is rebuilt when the mixed context, image/batch shape, manual seed list, cache-point count, keyframe mode, deep-layer threshold, or stabilizer range changes. Restarting ComfyUI also clears it. System-RAM usage scales with spatial token count, cached layers, and keyframe count; only the seed average is stored, so adding more reference seeds increases first-run compute but not cache size. A 1024-class, full-layer Anima cache can require several GiB with eight points. `adaptive_q` copies each first-run candidate to CPU for scoring but immediately removes the least useful interior frame, so retained memory stays bounded. Interpolation also introduces small CPU-to-GPU transfer and arithmetic cost, but no additional model pass after warmup.
+The warm cache is owned by the patched model object and lasts for the current ComfyUI session. It is rebuilt when the mixed context, image/batch shape, selected seed list, cache-point count, keyframe mode, deep-layer threshold, or stabilizer range changes. Automatic mode intentionally selects new seeds on every execution, so it warms a new cache each time; use a fixed list for cross-execution reuse. Restarting ComfyUI also clears it. System-RAM usage scales with spatial token count, cached layers, and keyframe count; only the seed average is stored, so adding more reference seeds increases first-run compute but not cache size. A 1024-class, full-layer Anima cache can require several GiB with eight points. `adaptive_q` copies each first-run candidate to CPU for scoring but immediately removes the least useful interior frame, so retained memory stays bounded. Interpolation also introduces small CPU-to-GPU transfer and arithmetic cost, but no additional model pass after warmup.
 
 The Adapter Mixer:
 
@@ -222,7 +226,7 @@ Not connecting this node = default behavior. Connecting it makes its settings ta
 
 Outputs:
 - `advanced_options`: connect to `AnimaArtistCrossAttn`, or to `AnimaArtistAdapterMixer` for its Q-only Anchor subset
-- `anchor_seeds_used`: text list of the anchor seeds that will be used. The Cross-Attn Mixer can generate fresh seeds when `anchor_seed_list` is empty; Adapter Q-only Anchor requires a manual list
+- `anchor_seeds_used`: text list of the anchor seeds that will be used. Both mixers accept fresh generated seeds when `anchor_seed_list` is empty or fixed user seeds when it is filled
 
 | Parameter | Description |
 |---|---|
@@ -234,9 +238,9 @@ Outputs:
 | `lowrank_k` | SVD truncation rank for `lowrank_avg`. 1 = most stable |
 | `artist_static_capture` | Freeze artist attention after `static_capture_k` warmup steps |
 | `static_capture_k` | Number of warmup steps before freezing. Default 6, range 1~12 |
-| `artist_anchor_q` | Replace user-seed Q with a fixed-seed anchor's Q. The strongest cross-seed stabilizer |
-| `anchor_seed_list` | Optional manual anchor seeds, e.g. `12345,67890`. When filled, `anchor_seeds_count` is ignored |
-| `anchor_seeds_count` | Number of anchor seeds to average. Default 1, range 1~4 |
+| `artist_anchor_q` | Replace user-seed Q with selected anchor-seed Q. The strongest cross-seed stabilizer |
+| `anchor_seed_list` | Optional fixed anchor seeds, e.g. `12345,67890`. Leave empty for automatic seeds; when filled, `anchor_seeds_count` is ignored |
+| `anchor_seeds_count` | Number of fresh random anchor seeds generated when the list is empty. Default 1, range 1~4 |
 | `anchor_user_blend` | Blend ratio between anchor Q and user Q. 0 = pure anchor, 1 = pure user |
 | `anchor_deep_layer_threshold` | Use anchor for shallow layers `[0, N)`, user Q for deep layers `[N, end]`. -1 disables |
 | `anchor_refresh_mode` | Adapter Mixer only: `once` or session-level `warm_cache` sigma keyframes |

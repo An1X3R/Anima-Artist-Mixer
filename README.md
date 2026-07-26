@@ -2,13 +2,17 @@
 
 A ComfyUI custom node for **multi-artist mixing** on Anima models. It encodes each artist separately, then mixes either cross-attention outputs or post-adapter embeddings, avoiding the prompt-side artist interference caused by Anima's LLM text encoder.
 
+## New in 26.8.2: Automatic Adapter Anchor Seeds
+
+The Adapter Mixer's Q-only Anchor once again accepts an empty `anchor_seed_list`. In that mode, `anchor_seeds_count` generates fresh random anchor seeds on every execution so users can explore different style references. Entering one or more fixed seeds still provides repeatable cross-run stabilization and allows `once` or `warm_cache` data to be reused while the cache key remains unchanged.
+
 ## New in 26.8.1: Post-Adapter Artist Mixing
 
 `Anima Artist Adapter Mixer (Experimental)` is the headline addition in 26.8.1. It moves artist mixing to the post-LLMAdapter context and performs the projection once at the model boundary instead of running the established artist-output mix inside every patched cross-attention layer.
 
 - In current Anima testing, this path delivered close to twice the generation throughput of the established Cross-Attn path while keeping visual quality close. Actual gains depend on artist count, resolution, sampler, and hardware.
 - The default `base_anchored` alignment keeps every real base and artist Adapter row. It aligns rows with T5 token IDs without pooling, truncating, or replacing the artist's Qwen source embedding and T5 target sequence.
-- Optional Q-only Anchor accepts a manual seed list for cross-seed style stability. `warm_cache` can spend extra time on the first complete run, retain bounded CPU Q keyframes, and reuse them for later sampler seeds; `adaptive_q` keeps the most informative keyframes.
+- Optional Q-only Anchor accepts either automatically generated or fixed seeds for cross-seed style control. `warm_cache` can spend extra time on the first complete run, retain bounded CPU Q keyframes, and reuse them for later sampler seeds when fixed seeds keep the cache key stable; `adaptive_q` keeps the most informative keyframes.
 - The established `Anima Artist Cross-Attn` node remains available and unchanged as the compatibility path. The two mixers are alternatives and must not be chained.
 
 Shortest Adapter workflow:
@@ -118,9 +122,9 @@ mixed = base + strength * perpendicular(sum(weight_i * artist_i) - base, base)
 
 This is T5-token-guided alignment after LLMAdapter, not padding of Qwen embeddings. Anima itself still zero-pads Adapter outputs shorter than 512 rows; those native zero rows are not treated as prompt tokens. `base_anchored` modifies cond rows only because the model wrapper does not receive the negative prompt's T5 IDs and therefore cannot align uncond rows honestly.
 
-For stronger cross-seed stability, connect `Anima Artist Options (Advanced)` to the Adapter Mixer's optional `advanced_options` input. Enable `artist_anchor_q` and enter one or more fixed manual values such as `42,12345` in `anchor_seed_list`. The selected seeds are averaged, and the Adapter anchor pass uses the same mixed post-Adapter context as the real denoising pass. The old per-artist attention mixer is not run a second time. `anchor_user_blend`, `anchor_deep_layer_threshold`, `stabilizer_end_percent`, `anchor_refresh_mode`, `anchor_cache_points`, and `anchor_keyframe_mode` apply; the other advanced mixing controls are ignored. Leaving `anchor_seed_list` empty is rejected because the Options node generates a new random anchor on each execution.
+For stronger cross-seed stability, connect `Anima Artist Options (Advanced)` to the Adapter Mixer's optional `advanced_options` input and enable `artist_anchor_q`. Leave `anchor_seed_list` empty to generate `anchor_seeds_count` fresh random references on every execution, or enter fixed values such as `42,12345` for repeatable stabilization. The selected seeds are averaged, and the Adapter anchor pass uses the same mixed post-Adapter context as the real denoising pass. The old per-artist attention mixer is not run a second time. `anchor_user_blend`, `anchor_deep_layer_threshold`, `stabilizer_end_percent`, `anchor_refresh_mode`, `anchor_cache_points`, and `anchor_keyframe_mode` apply; the other advanced mixing controls are ignored.
 
-`anchor_refresh_mode=once` keeps the low-cost legacy timing: one start-sigma Q snapshot is reused throughout sampling and across later executions while its cache key remains valid. `warm_cache` runs the selected anchor seeds at every active sigma during the first complete sampling run, keeps `anchor_cache_points` averaged Q keyframes in CPU RAM, and linearly interpolates them on later runs. The default is 8 points. `anchor_keyframe_mode=uniform_sigma` retains evenly spaced sigma frames. `adaptive_q` observes every warmup sigma and keeps the bounded set whose sampled Q trajectory has the greatest interpolation error; it adds CPU transfer during the first warmup but has the same later-run model-forward count. Changing only the KSampler seed then needs no anchor model passes. Prompt/context, artist mix, resolution/batch shape, anchor seeds, cache-point count, keyframe mode, or stabilizer range changes rebuild the cache. The cache is session-only and is cleared by a ComfyUI restart. First-run time scales with the number of manual anchor seeds; later runs still transfer cached Q keyframes from CPU but do not execute the anchor model.
+`anchor_refresh_mode=once` keeps the low-cost legacy timing: one start-sigma Q snapshot is reused throughout sampling and across later executions while its cache key remains valid. `warm_cache` runs the selected anchor seeds at every active sigma during the first complete sampling run, keeps `anchor_cache_points` averaged Q keyframes in CPU RAM, and linearly interpolates them on later runs. The default is 8 points. `anchor_keyframe_mode=uniform_sigma` retains evenly spaced sigma frames. `adaptive_q` observes every warmup sigma and keeps the bounded set whose sampled Q trajectory has the greatest interpolation error; it adds CPU transfer during the first warmup but has the same later-run model-forward count. Changing only the KSampler seed then needs no anchor model passes when the anchor seed list is fixed. Prompt/context, artist mix, resolution/batch shape, anchor seeds, cache-point count, keyframe mode, or stabilizer range changes rebuild the cache. Automatic mode intentionally generates a new seed list for each execution, so it also starts a new `once` or `warm_cache` cycle. The cache is session-only and is cleared by a ComfyUI restart. First-run time scales with the number of selected anchor seeds; later runs with fixed seeds still transfer cached Q keyframes from CPU but do not execute the anchor model.
 
 Do not chain Adapter Mixer and Cross-Attn Mixer on the same model. They remain alternative artist-mixing algorithms. Q-only Anchor already patches the Adapter Mixer's attention Q when enabled; chaining the full Cross-Attn node would inject the artist set twice.
 
@@ -259,7 +263,7 @@ style_balance = 0.45 - 0.60  # stronger
 
 Very high values can make different artists feel more averaged.
 
-## Manual Anchor Seeds
+## Anchor Seeds: Automatic or Fixed
 
 When `artist_anchor_q` is enabled, `anchor_seed_list` can pin the anchor pass to seeds you choose:
 
@@ -269,7 +273,7 @@ anchor_seed_list = 12345,67890
 
 If `anchor_seed_list` is empty, `anchor_seeds_count` controls how many fresh random anchor seeds are generated for each execution. If `anchor_seed_list` is filled, `anchor_seeds_count` is ignored. You can also enter a single seed to lock the style reference to one selected result.
 
-For the Adapter Mixer, a manual list is mandatory. Multiple manual seeds are averaged before either `once` or `warm_cache` is applied. Start with one seed to limit warmup cost; use two or more only when a single reference seed carries too much of its own composition bias.
+The Adapter Mixer accepts both modes. Automatic seeds preserve a way to search for a useful style reference, but the new list causes `once` and `warm_cache` to rebuild on the next execution. Fixed seeds preserve the chosen reference and permit cross-execution cache reuse. Multiple seeds are averaged before either refresh mode is applied. Start with one seed to limit warmup cost; use two or more only when a single reference seed carries too much of its own composition bias.
 
 `warm_cache` stores only the averaged result, not a separate copy per seed. RAM usage still scales with resolution, active anchor layers, and `anchor_cache_points`. Eight full-layer keyframes can require several GiB at 1024-class resolutions; lower `anchor_cache_points` or a finite `anchor_deep_layer_threshold` reduces that cost. `adaptive_q` temporarily copies each observed warmup frame to CPU for scoring, then immediately prunes back to the configured bound.
 
@@ -293,7 +297,7 @@ This version includes the new post-Adapter path plus structural and runtime fixe
 - Add an experimental post-adapter mixer that uses a model-level context wrapper instead of per-layer attention patches.
 - Add `shared_base_ids` alignment so every artist Adapter output uses the same T5 target-token grid.
 - Add lossless `base_anchored` alignment that preserves every real base and artist Adapter row; keep `shared_base_ids` as an A/B mode and remove the unsafe `pad_longest` UI mode.
-- Add optional Q-only Anchor for the Adapter Mixer, using a manual cross-attention anchor seed without running the old artist mixer twice.
+- Add optional Q-only Anchor for the Adapter Mixer, using selected cross-attention anchor seeds without running the old artist mixer twice.
 - Make Adapter Anchor-Q reference the mixed post-Adapter context and add a session-level sigma-keyframe warm cache for later sampler seeds.
 - Cache the final projected Adapter context, avoid per-step GPU value fingerprints, and add bounded adaptive Q keyframe selection.
 

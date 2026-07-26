@@ -1,6 +1,10 @@
 This plugin solves the problem of Anima not handling artist chains well.
 This plugin provides the established Cross-Attn path plus an experimental post-adapter path.
 
+Version 26.8.2 restores automatic Adapter Anchor seeds:
+	Leave anchor_seed_list empty to generate anchor_seeds_count fresh random seeds per execution for style exploration
+	Enter fixed seeds for repeatable stabilization and reusable once/warm_cache data
+
 Anima Artist Pack
 Node for inputting artist chain and prompt, here referred to as artist and base_prompt
 1. This node has two text boxes (top and bottom), one clip input and one custom-type artist_pack output
@@ -55,10 +59,10 @@ An alternative to Anima Artist Cross-Attn. Do not connect both in series.
 6. base_anchored keeps uncond rows unchanged because negative T5 IDs are unavailable for honest alignment
 7. Optional Q-only Anchor:
 	Connect Anima Artist Options(Advanced) to the Adapter Mixer's advanced_options input
-	Enable artist_anchor_q and enter fixed manual anchor_seed_list values such as 42,12345
+	Enable artist_anchor_q; leave anchor_seed_list empty for automatic seeds or enter fixed values such as 42,12345
 	Selected seeds are averaged and the anchor pre-run uses the mixed post-Adapter context
 	anchor_user_blend, anchor_deep_layer_threshold, stabilizer_end_percent, anchor_refresh_mode, anchor_cache_points, and anchor_keyframe_mode also apply
-	An empty seed list is rejected because it changes the anchor between executions
+	Automatic seeds change on each execution for style exploration; fixed seeds allow cross-execution cache reuse
 	Q-only Anchor changes cond Q but does not run the old per-artist attention mixer again
 8. Anchor refresh modes:
 	once is the default and reuses one start-sigma Q snapshot
@@ -81,9 +85,9 @@ Provides advanced settings for users
 	lowrank_k                    only effective when combine_mode=lowrank_avg, 1=most stable, 2~3 keeps small per-artist differences
 	artist_static_capture        accumulate artist attention for the first K steps then freeze, 30~50% performance gain
 	static_capture_k             the K above, default 6, range 1~12
-	artist_anchor_q              use a fixed-seed anchor instead of user-seed Q, the most stable approach across seeds
-	anchor_seed_list             optional manual anchor seeds, e.g. 12345,67890; when filled, anchor_seeds_count is ignored
-	anchor_seeds_count           number of anchor seeds, default 1, range 1~4
+	artist_anchor_q              use selected anchor-seed Q instead of user-seed Q, the strongest stabilizer across seeds
+	anchor_seed_list             optional fixed anchor seeds, e.g. 12345,67890; leave empty for automatic seeds
+	anchor_seeds_count           fresh random seed count when anchor_seed_list is empty, default 1, range 1~4
 	anchor_user_blend            anchor / user-x blend ratio, 0=pure anchor, 1=pure user x
 	anchor_deep_layer_threshold  shallow layers use anchor for stable style, deep layers use user x for fine brushwork, -1=disabled
 	anchor_refresh_mode          [Adapter Mixer only] once=single snapshot, warm_cache=session reuse

@@ -176,6 +176,28 @@ class TokenAlignmentTests(unittest.TestCase):
 
 
 class OptionNodeTests(unittest.TestCase):
+    @mock.patch(
+        "anima_mixer.nodes_ui.secrets.randbelow",
+        side_effect=[11, 11, 22, 33],
+    )
+    def test_empty_seed_list_generates_requested_unique_seed_count(self, randbelow):
+        options, seeds_used = AnimaArtistOptions().build(
+            start_block=0,
+            end_block=-1,
+            start_percent=0.0,
+            end_percent=1.0,
+            normalize_weights=True,
+            artist_anchor_q=True,
+            anchor_seed_list="",
+            anchor_seeds_count=3,
+        )
+
+        self.assertEqual(seeds_used, "11,22,33")
+        self.assertEqual(options["anchor_seed_list"], "11,22,33")
+        self.assertFalse(options["anchor_seed_list_is_manual"])
+        self.assertEqual(options["anchor_seeds_count"], 3)
+        self.assertEqual(randbelow.call_count, 4)
+
     def test_warm_cache_options_keep_manual_seed_list(self):
         options, seeds_used = AnimaArtistOptions().build(
             start_block=0,
@@ -575,8 +597,12 @@ class EmbeddingAdapterTests(unittest.TestCase):
         self.assertFalse(torch.equal(observed["context"][0], base[0]))
         self.assertTrue(torch.equal(observed["context"][1], base[1]))
 
-    def test_adapter_q_anchor_requires_a_manual_seed(self):
-        dm = FakeAdapterModel()
+    @mock.patch(
+        "anima_mixer.nodes_ui.secrets.randbelow",
+        side_effect=[987654321, 123456789],
+    )
+    def test_adapter_q_anchor_accepts_automatically_generated_seeds(self, randbelow):
+        dm = FakeAnchorAdapterModel()
         model = FakeModelPatcher(dm)
         artist_pack = {
             "conditionings": [[[
@@ -591,22 +617,37 @@ class EmbeddingAdapterTests(unittest.TestCase):
             ]],
         }
 
-        with self.assertRaisesRegex(ValueError, "fixed manual anchor_seed_list"):
-            AnimaArtistAdapterMixer().patch(
-                model,
-                artist_pack,
-                strength=1.0,
-                normalize_weights=True,
-                alignment_mode=ALIGN_BASE_ANCHORED,
-                enabled=True,
-                apply_to_uncond=False,
-                uncond_strength=0.0,
-                advanced_options={
-                    "artist_anchor_q": True,
-                    "anchor_seed_list": "987654321",
-                    "anchor_seed_list_is_manual": False,
-                },
-            )
+        advanced_options, seeds_used = AnimaArtistOptions().build(
+            start_block=0,
+            end_block=-1,
+            start_percent=0.0,
+            end_percent=1.0,
+            normalize_weights=True,
+            artist_anchor_q=True,
+            anchor_seed_list="",
+            anchor_seeds_count=2,
+        )
+        patched_model, _ = AnimaArtistAdapterMixer().patch(
+            model,
+            artist_pack,
+            strength=1.0,
+            normalize_weights=True,
+            alignment_mode=ALIGN_BASE_ANCHORED,
+            enabled=True,
+            apply_to_uncond=False,
+            uncond_strength=0.0,
+            advanced_options=advanced_options,
+        )
+
+        patch_path = "diffusion_model.blocks.0.cross_attn.forward"
+        attention_patch = patched_model.object_patches[patch_path]
+        self.assertEqual(seeds_used, "987654321,123456789")
+        self.assertFalse(advanced_options["anchor_seed_list_is_manual"])
+        self.assertEqual(
+            attention_patch.state["anchor_seed_list"],
+            [987654321, 123456789],
+        )
+        self.assertEqual(randbelow.call_count, 2)
 
     def test_adapter_q_anchor_reuses_fixed_cond_q_and_preserves_uncond_q(self):
         dm = FakeAnchorAdapterModel()

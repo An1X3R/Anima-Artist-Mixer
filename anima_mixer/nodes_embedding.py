@@ -120,15 +120,11 @@ class AnimaArtistAdapterMixer:
             advanced.get("anchor_seed_list", ""),
             ANCHOR_SEEDS_MAX,
         )
-        anchor_seed_is_manual = bool(advanced.get(
-            "anchor_seed_list_is_manual",
-            bool(anchor_seed_list),
-        ))
-        if artist_anchor_q and (not anchor_seed_is_manual or not anchor_seed_list):
+        if artist_anchor_q and not anchor_seed_list:
             raise ValueError(
-                "[AnimaAdapterMixer] Q-only Anchor requires a fixed manual "
-                "anchor_seed_list. Enter at least one seed in Anima Artist "
-                "Options (Advanced); an empty list changes between executions."
+                "[AnimaAdapterMixer] Q-only Anchor requires at least one resolved "
+                "anchor seed. Connect Anima Artist Options (Advanced) so an empty "
+                "anchor_seed_list can generate seeds automatically."
             )
         anchor_seeds_count = max(
             1,
@@ -351,7 +347,7 @@ class AnimaArtistAdapterMixer:
                 )
             logger.info(
                 "[AnimaAdapterAnchorQ] Q-only Anchor is active on %d layers; "
-                "manual seeds=%s, user blend=%.2f, deep threshold=%d, "
+                "seeds=%s, user blend=%.2f, deep threshold=%d, "
                 "refresh=%s, cache points=%d, keyframes=%s.",
                 anchor_block_count,
                 ",".join(str(seed) for seed in anchor_seed_list),

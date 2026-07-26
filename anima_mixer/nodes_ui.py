@@ -68,7 +68,7 @@ class AnimaArtistOptions:
                 }),
                 "artist_anchor_q": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Use fixed-seed anchor hidden states as artist-attn Q.",
+                    "tooltip": "Use selected anchor-seed hidden states as artist-attn Q.",
                 }),
                 "anchor_seed_list": ("STRING", {
                     "default": "",
