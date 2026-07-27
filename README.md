@@ -8,7 +8,7 @@ The Adapter Mixer's Q-only Anchor once again accepts an empty `anchor_seed_list`
 
 ## New in 26.8.1: Post-Adapter Artist Mixing
 
-### Special thanks [sparrow]（ https://github.com/spawner1145 )
+### Special thanks [spawner]（ https://github.com/spawner1145 )
 The idea and formula of Post Adapter Artist Mixing were proposed by him
 
 `Anima Artist Adapter Mixer (Experimental)` is the headline addition in 26.8.1. It moves artist mixing to the post-LLMAdapter context and performs the projection once at the model boundary instead of running the established artist-output mix inside every patched cross-attention layer.
