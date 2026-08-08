@@ -6,7 +6,7 @@ A ComfyUI custom node for **multi-artist mixing** on Anima models. It encodes ea
 
 This maintenance release hardens Mixer state across interrupted sampling, model clones, dynamic VRAM/offload, LoRA changes, and multi-GPU wrapper paths. It clears stale GPU-side Mixer state at execution boundaries and treats interrupt control-flow correctly, while keeping the existing Cross-Attn and Adapter mixing interfaces and math unchanged.
 
-The black-image/noise failure addressed here was observed in testing with RTX 50-series hardware combined with dynamic VRAM/offload and interrupted sampling followed by LoRA changes. Other hardware has not been confirmed to expose the same failure, so this should be read as a compatibility note rather than a hardware-specific guarantee.
+The black-image/noise failure addressed here was observed in testing with RTX 50-series hardware combined with dynamic VRAM/offload and interrupted sampling followed by LoRA changes. It may also be triggered on earlier GPU generations; the 50-series is only the environment where we confirmed it most clearly. Treat this as a compatibility note, not a hardware-specific guarantee.
 
 ## New in 26.8.2: Automatic Adapter Anchor Seeds
 
