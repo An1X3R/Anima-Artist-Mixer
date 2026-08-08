@@ -17,11 +17,14 @@ from .constants import (
     ANCHOR_SEEDS_POOL,
 )
 from .patching import (
+    begin_mixer_execution,
+    clear_mixer_run_state,
     context_fingerprint,
+    diffusion_model_for_apply_model,
+    execution_tensor_signature,
     in_stabilizer_window,
-    reset_run_state,
+    resolve_multigpu_worker_wrapper,
     should_reraise,
-    tensor_cache_signature,
 )
 
 logger = logging.getLogger(__name__)
@@ -67,9 +70,8 @@ def _context_signature(state, context):
             return (
                 "adapter_mixed",
                 entry.get("key"),
-                tensor_cache_signature(context),
             )
-        return ("adapter_context", tensor_cache_signature(context))
+        return ("adapter_context", execution_tensor_signature(state, context))
     return context_fingerprint(context)
 
 
@@ -81,6 +83,7 @@ def _trajectory_signature(state, user_x, c_dict):
     return (
         tuple(user_x.shape),
         str(user_x.dtype),
+        state.get("_cache_namespace"),
         _context_signature(state, context),
         tuple(_resolve_anchor_seeds(state)),
         int(state.get("anchor_cache_points", ANCHOR_CACHE_POINTS_DEFAULT)),
@@ -121,7 +124,51 @@ def _new_anchor_trajectory(state, signature, start_sigma):
         "active_sigma": None,
         "active_device": None,
         "active_dtype": None,
+        "observed_sigmas": [],
+        "sampling_complete": False,
+        "terminal_sigma": None,
+        "minimum_observed_frames": (
+            max(3, min(points, 8))
+            if _resolve_keyframe_mode(state) == ANCHOR_KEYFRAME_ADAPTIVE_Q
+            else max(2, min(points, 3))
+        ),
     }
+
+
+def _configure_trajectory_schedule(trajectory, state, c_dict):
+    """Record the terminal denoising sigma when ComfyUI exposes the schedule."""
+    if trajectory.get("terminal_sigma") is not None:
+        return
+    transformer_options = c_dict.get("transformer_options", {}) or {}
+    sample_sigmas = transformer_options.get("sample_sigmas")
+    values = None
+    if torch.is_tensor(sample_sigmas) and sample_sigmas.numel() > 0:
+        try:
+            values = [
+                float(value)
+                for value in sample_sigmas.detach().reshape(-1).to("cpu").tolist()
+            ]
+        except Exception:
+            values = None
+    if values:
+        # The final schedule entry is normally the post-denoise zero.  The last
+        # model call uses the preceding sigma, so use that as the completion mark.
+        terminal = values[-2] if len(values) >= 2 else values[-1]
+        trajectory["terminal_sigma"] = float(terminal)
+    else:
+        threshold = state.get("stabilizer_min_sigma")
+        if threshold is not None:
+            trajectory["terminal_sigma"] = float(threshold)
+
+
+def _record_trajectory_progress(trajectory, sigma):
+    sigma = float(sigma)
+    observed = trajectory.setdefault("observed_sigmas", [])
+    if not any(abs(float(value) - sigma) <= 1e-6 for value in observed):
+        observed.append(sigma)
+    terminal = trajectory.get("terminal_sigma")
+    if terminal is not None and sigma <= float(terminal) + 1e-3:
+        trajectory["sampling_complete"] = True
 
 
 def _copy_anchor_cache_to_cpu(state, cache):
@@ -146,6 +193,28 @@ def _frame_bytes(layers):
     )
 
 
+def _evenly_spaced_positions(length, count, device):
+    length = int(length)
+    count = int(count)
+    if length <= 0 or count <= 0:
+        return torch.empty(0, device=device, dtype=torch.long)
+    if count == 1:
+        return torch.zeros(1, device=device, dtype=torch.long)
+
+    last_index = length - 1
+    denominator = count - 1
+    numerators = torch.arange(
+        count,
+        device=device,
+        dtype=torch.long,
+    ) * last_index
+    return torch.div(
+        numerators + denominator // 2,
+        denominator,
+        rounding_mode="floor",
+    ).clamp_(0, last_index)
+
+
 def _cache_sketch(cache, values_per_layer=256):
     pieces = []
     for layer_index in sorted(cache):
@@ -156,12 +225,11 @@ def _cache_sketch(cache, values_per_layer=256):
         if count == 1:
             sample = flat[:1]
         else:
-            positions = torch.linspace(
-                0,
-                int(flat.numel()) - 1,
-                steps=count,
-                device=flat.device,
-            ).round().to(torch.long)
+            positions = _evenly_spaced_positions(
+                flat.numel(),
+                count,
+                flat.device,
+            )
             sample = flat.index_select(0, positions)
         pieces.append(sample.to(dtype=torch.float32))
     return torch.cat(pieces) if pieces else torch.empty(0, dtype=torch.float32)
@@ -244,6 +312,7 @@ def _record_trajectory_step(state, trajectory, sigma):
         return
 
     sigma = float(sigma)
+    _record_trajectory_progress(trajectory, sigma)
     trajectory["last_sigma"] = sigma
     trajectory["last_cache"] = cache
     if trajectory.get("keyframe_mode") == ANCHOR_KEYFRAME_ADAPTIVE_Q:
@@ -282,10 +351,16 @@ def _finalize_anchor_trajectory(state):
             1,
             len(trajectory.get("targets") or []) - 1,
         )
-    if len(trajectory["frames"]) < 2 or not targets_complete:
+    enough_observations = (
+        trajectory.get("sampling_complete", False)
+        or int(trajectory.get("observed_frames", 0)) >= int(
+            trajectory.get("minimum_observed_frames", 2)
+        )
+    )
+    if len(trajectory["frames"]) < 2 or not targets_complete or not enough_observations:
         logger.warning(
-            "[%s] warm-cache run ended before enough sigma keyframes were "
-            "captured; the partial cache is discarded.",
+            "[%s] warm-cache run ended before enough sigma keyframes/progress "
+            "were captured; the partial cache is discarded.",
             state.get("anchor_log_name", "AnimaCrossAttn"),
         )
         state["_anchor_trajectory"] = None
@@ -418,6 +493,7 @@ def _run_or_load_warm_anchor(state, user_x, user_timestep, c_dict, apply_model, 
     if signature is None:
         return
     trajectory = _ensure_anchor_trajectory(state, signature, sigma)
+    _configure_trajectory_schedule(trajectory, state, c_dict)
     if trajectory.get("ready", False):
         _load_anchor_trajectory(state, trajectory, sigma, user_x)
         return
@@ -439,6 +515,41 @@ def _run_or_load_warm_anchor(state, user_x, user_timestep, c_dict, apply_model, 
 def make_sigma_capture(state, prev_wrapper):
     def wrapper(apply_model, options):
         ts = options.get("timestep")
+        user_ts = ts
+        c_dict = options.get("c", {}) or {}
+        transformer_options = c_dict.get("transformer_options", {}) or {}
+        is_multigpu = (
+            isinstance(transformer_options, dict)
+            and transformer_options.get("multigpu_thread_device") is not None
+        )
+        if is_multigpu:
+            active_dm = diffusion_model_for_apply_model(
+                apply_model,
+                state.get("dm_ref"),
+            )
+            if active_dm is not None:
+                worker_device = transformer_options.get("multigpu_thread_device")
+                device_key = (
+                    getattr(worker_device, "type", None),
+                    getattr(worker_device, "index", None),
+                )
+                state.setdefault("_multigpu_dm_by_worker", {})[device_key] = active_dm
+            worker_wrapper = resolve_multigpu_worker_wrapper(
+                apply_model,
+                options,
+                wrapper,
+            )
+            if worker_wrapper is not None:
+                # See the Adapter wrapper: model_options is shared by the
+                # scheduler, but each clone has a rebound sigma wrapper/state.
+                worker_options = dict(options)
+                worker_options["_anima_mixer_worker_dispatch"] = True
+                try:
+                    return worker_wrapper(apply_model, worker_options)
+                except BaseException as error:
+                    if should_reraise(error):
+                        clear_mixer_run_state(state, interrupted=True)
+                    raise
         cur_sigma = None
         if ts is not None:
             try:
@@ -447,23 +558,61 @@ def make_sigma_capture(state, prev_wrapper):
             except Exception:
                 pass
 
-        prev_run_sigma = state.get("_run_last_sigma")
-        is_run_start = prev_run_sigma is None or (
-            cur_sigma is not None and cur_sigma > prev_run_sigma + 1e-3
+        # Adapter Mixer reaches this wrapper through its embedding wrapper,
+        # which has already isolated closure state before any cached context is
+        # read. Cross-Attn Mixer invokes this wrapper directly, so preserve a
+        # compatible fallback for that path.
+        is_run_start = state.pop("_adapter_mixer_run_start", None)
+        finalize_warm_cache = state.pop(
+            "_adapter_mixer_finalize_warm_cache", False,
         )
+        if is_run_start is True and state.get("_mixer_run_start_pending", False):
+            # Cross-Attn Mixer enters this sigma wrapper directly.  Its
+            # on_pre_run callback already reset the run and left a pending
+            # boundary marker, so consume that marker here to record the first
+            # real sigma/call as well.  The Adapter wrapper has already called
+            # begin_mixer_execution and therefore has no pending marker.
+            begin_mixer_execution(
+                state,
+                apply_model,
+                ts,
+                owner_token_override=(
+                    ("multigpu_wrapper", id(state)) if is_multigpu else None
+                ),
+            )
+            state.pop("_adapter_mixer_run_start", None)
+        if is_run_start is None:
+            last_run_marker = state.get("_last_run_had_calls")
+            prev_run_had_calls = bool(
+                state.get("_run_active", False)
+                if last_run_marker is None else last_run_marker
+            )
+            is_run_start, _owner_changed = begin_mixer_execution(
+                state,
+                apply_model,
+                ts,
+                owner_token_override=(
+                    ("multigpu_wrapper", id(state)) if is_multigpu else None
+                ),
+            )
+            # ``begin_mixer_execution`` writes this marker for the Adapter
+            # wrapper to hand to us.  Cross-Attn calls begin directly, so clear
+            # the hand-off marker here or every other call would skip begin().
+            state.pop("_adapter_mixer_run_start", None)
+            finalize_warm_cache = bool(
+                prev_run_had_calls
+                and str(state.get("anchor_refresh_mode", "once"))
+                == ANCHOR_REFRESH_WARM_CACHE
+            )
         refresh_mode = str(state.get("anchor_refresh_mode", "once"))
-        if (
-            is_run_start
-            and prev_run_sigma is not None
-            and refresh_mode == ANCHOR_REFRESH_WARM_CACHE
-        ):
+        if is_multigpu:
+            state["_multigpu_call"] = True
+        if is_run_start and finalize_warm_cache:
             _finalize_anchor_trajectory(state)
-        if is_run_start:
-            reset_run_state(state)
-        state["_run_last_sigma"] = cur_sigma
 
         if (
-            state.get("artist_anchor_q", False)
+            not is_multigpu
+            and state.get("artist_anchor_q", False)
             and not state.get("_anchor_failed", False)
             and not state.get("_embedding_mixer_failed", False)
             and in_stabilizer_window(state)
@@ -475,8 +624,6 @@ def make_sigma_capture(state, prev_wrapper):
             )
             state["_anchor_last_sigma"] = cur_sigma
             user_x = options.get("input")
-            user_ts = options.get("timestep")
-            c_dict = options.get("c", {}) or {}
             if user_x is not None and user_ts is not None and c_dict:
                 if refresh_mode == ANCHOR_REFRESH_WARM_CACHE and cur_sigma is not None:
                     _run_or_load_warm_anchor(
@@ -490,9 +637,24 @@ def make_sigma_capture(state, prev_wrapper):
                 elif is_anchor_start or not state.get("_anchor_cache"):
                     maybe_run_anchor(state, user_x, user_ts, c_dict, apply_model=apply_model)
 
-        if prev_wrapper is not None:
-            return prev_wrapper(apply_model, options)
-        return apply_model(options["input"], options["timestep"], **options["c"])
+        try:
+            if prev_wrapper is not None:
+                return prev_wrapper(apply_model, options)
+            return apply_model(options["input"], options["timestep"], **options["c"])
+        except BaseException as error:
+            if should_reraise(error):
+                clear_mixer_run_state(state, interrupted=True)
+            raise
+
+    # Mark only the sigma wrapper created by Adapter Mixer.  ModelPatcher.clone()
+    # carries function wrappers forward, so a later Mixer invocation must be
+    # able to remove this layer without touching wrappers owned by other nodes.
+    wrapper._anima_adapter_anchor_sigma_wrapper = True
+    wrapper._anima_adapter_anchor_sigma_previous = prev_wrapper
+    wrapper._anima_adapter_anchor_sigma_state = state
+    wrapper._anima_mixer_state = state
+    wrapper._anima_mixer_previous = prev_wrapper
+    wrapper._anima_mixer_factory = make_sigma_capture
     return wrapper
 
 
@@ -521,6 +683,7 @@ def maybe_run_anchor(state, user_x, user_timestep, c_dict, apply_model=None):
         sigma_key = None
     anchor_seeds = _resolve_anchor_seeds(state)
     new_key = (
+        state.get("_cache_namespace"),
         tuple(user_x.shape),
         _context_signature(state, original_context),
         sigma_key,
@@ -613,8 +776,9 @@ def maybe_run_anchor(state, user_x, user_timestep, c_dict, apply_model=None):
             state["_anchor_cache"] = {
                 idx: (acc * inv).to(user_x.dtype) for idx, acc in accumulator.items()
             }
-    except Exception as e:
+    except BaseException as e:
         if should_reraise(e):
+            clear_mixer_run_state(state, interrupted=True)
             raise
         logger.warning(
             "[%s] anchor pre-run failed; anchor_q is disabled: %s",

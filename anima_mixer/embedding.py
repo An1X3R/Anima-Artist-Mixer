@@ -10,10 +10,16 @@ from .constants import ALIGN_BASE_ANCHORED, ALIGN_SHARED_BASE_IDS
 from .math_utils import project_perpendicular
 from .parsing import normalize_weights
 from .patching import (
+    begin_mixer_execution,
     broadcast_batch,
+    clear_mixer_run_state,
+    execution_tensor_signature,
+    diffusion_model_for_apply_model,
     preprocess_one,
     resolve_mask,
     resolve_strengths,
+    resolve_multigpu_worker_wrapper,
+    runtime_input_signature,
     should_reraise,
     tensor_cache_signature,
 )
@@ -131,10 +137,15 @@ def mix_projected_context(base, artist_sum, strengths, mask, fallback_base=None)
     return torch.where(row_mask, mixed, fallback_base)
 
 
-def build_artist_embedding_sum(state, ref_context):
+def build_artist_embedding_sum(state, ref_context, dm=None):
     """Run artist prompts through the model adapter once and cache their sum."""
     alignment_mode = state["alignment_mode"]
+    dm = state["dm_ref"] if dm is None else dm
     cache_key = (
+        state.get("_cache_namespace"),
+        state.get("_model_weight_patch_identity"),
+        runtime_input_signature(state),
+        id(dm),
         ref_context.device.type,
         ref_context.device.index,
         str(ref_context.dtype),
@@ -145,7 +156,6 @@ def build_artist_embedding_sum(state, ref_context):
     if cached is not None:
         return cached
 
-    dm = state["dm_ref"]
     embeddings = []
     labels = state.get("labels") or []
     for index, (raw, artist_ids, artist_weights) in enumerate(zip(
@@ -173,8 +183,9 @@ def build_artist_embedding_sum(state, ref_context):
                 ref_context.device,
                 ref_context.dtype,
             )
-        except Exception as error:
+        except BaseException as error:
             if should_reraise(error):
+                clear_mixer_run_state(state, interrupted=True)
                 raise
             label = labels[index] if index < len(labels) else f"#{index}"
             raise ValueError(
@@ -207,9 +218,12 @@ def _call_underlying(prev_wrapper, apply_model, options):
     )
 
 
-def _mixed_context_cache_key(context, mask, strengths):
+def _mixed_context_cache_key(state, context, mask, strengths):
     return (
-        tensor_cache_signature(context),
+        state.get("_cache_namespace"),
+        state.get("_model_weight_patch_identity"),
+        runtime_input_signature(state),
+        execution_tensor_signature(state, context),
         tuple(bool(value) for value in mask),
         tuple(float(value) for value in strengths),
     )
@@ -232,10 +246,47 @@ def _cached_mixed_context(state, context, cache_key):
 def make_adapter_embedding_wrapper(state, prev_wrapper):
     """Replace post-adapter context at the model boundary, preserving wrapper chains."""
     def wrapper(apply_model, options):
+        raw_c = options.get("c") or {}
+        transformer_options = raw_c.get("transformer_options") or {}
+        is_multigpu = (
+            isinstance(transformer_options, dict)
+            and transformer_options.get("multigpu_thread_device") is not None
+        )
+        if is_multigpu:
+            worker_wrapper = resolve_multigpu_worker_wrapper(
+                apply_model,
+                options,
+                wrapper,
+            )
+            if worker_wrapper is not None:
+                # The multigpu sampler calls the main model-options wrapper for
+                # every clone.  Re-enter through the clone-local rebound
+                # wrapper so its dm_ref, caches, and failure flags belong to
+                # the worker model rather than the first GPU.
+                worker_options = dict(options)
+                worker_options["_anima_mixer_worker_dispatch"] = True
+                return worker_wrapper(apply_model, worker_options)
+        is_run_start, _owner_changed = begin_mixer_execution(
+            state,
+            apply_model,
+            options.get("timestep"),
+            owner_token_override=(
+                ("multigpu_wrapper", id(state)) if is_multigpu else None
+            ),
+        )
+        if is_multigpu:
+            # ComfyUI's multigpu sampler invokes the main model-options wrapper
+            # concurrently for every device.  Keep this wrapper's owner token
+            # stable and avoid sharing a live mixed-context entry across workers.
+            state["_multigpu_call"] = True
+        # Always hand the result to the optional sigma wrapper.  ``False`` is
+        # meaningful: it tells the Adapter path that begin() already ran for
+        # this call, preventing the sigma wrapper from running it a second time.
+        state["_adapter_mixer_run_start"] = bool(is_run_start)
         if state.get("_embedding_mixer_failed", False):
             return _call_underlying(prev_wrapper, apply_model, options)
 
-        c = options.get("c") or {}
+        c = raw_c
         context_key = None
         for key in ("c_crossattn", "context"):
             if torch.is_tensor(c.get(key)):
@@ -271,10 +322,22 @@ def make_adapter_embedding_wrapper(state, prev_wrapper):
                 state["strength"],
                 state.get("uncond_strength", 1.0),
             )
-            cache_key = _mixed_context_cache_key(context, mask, strengths)
-            mixed_context = _cached_mixed_context(state, context, cache_key)
+            cache_key = _mixed_context_cache_key(state, context, mask, strengths)
+            mixed_context = (
+                None
+                if is_multigpu
+                else _cached_mixed_context(state, context, cache_key)
+            )
             if mixed_context is None:
-                artist_sum = build_artist_embedding_sum(state, context)
+                active_dm = diffusion_model_for_apply_model(
+                    apply_model,
+                    state.get("dm_ref"),
+                )
+                artist_sum = build_artist_embedding_sum(
+                    state,
+                    context,
+                    dm=active_dm,
+                )
                 projection_base = context
                 fallback_base = context
                 if state["alignment_mode"] == ALIGN_BASE_ANCHORED:
@@ -293,20 +356,22 @@ def make_adapter_embedding_wrapper(state, prev_wrapper):
                     mask,
                     fallback_base=fallback_base,
                 )
-                state["_mixed_context_cache"] = {
-                    "source": context,
-                    "key": cache_key,
-                    "mixed": mixed_context,
-                    "mixed_signature": tensor_cache_signature(mixed_context),
-                }
+                if not is_multigpu:
+                    state["_mixed_context_cache"] = {
+                        "source": context,
+                        "key": cache_key,
+                        "mixed": mixed_context,
+                        "mixed_signature": tensor_cache_signature(mixed_context),
+                    }
 
             mixed_c = dict(c)
             mixed_c[context_key] = mixed_context
             mixed_options = dict(options)
             mixed_options["c"] = mixed_c
             return _call_underlying(prev_wrapper, apply_model, mixed_options)
-        except Exception as error:
+        except BaseException as error:
             if should_reraise(error):
+                clear_mixer_run_state(state, interrupted=True)
                 raise
             if not state.get("_warned_embedding_failure", False):
                 logger.exception(
@@ -318,4 +383,30 @@ def make_adapter_embedding_wrapper(state, prev_wrapper):
             state["_embedding_mixer_failed"] = True
             return _call_underlying(prev_wrapper, apply_model, options)
 
+    wrapper._anima_adapter_mixer_wrapper = True
+    wrapper._anima_adapter_mixer_previous = prev_wrapper
+    wrapper._anima_adapter_mixer_state = state
+    wrapper._anima_mixer_state = state
+    wrapper._anima_mixer_previous = prev_wrapper
+    wrapper._anima_mixer_factory = make_adapter_embedding_wrapper
+    return wrapper
+
+
+def unwrap_adapter_embedding_wrapper(wrapper):
+    """Remove Adapter Mixer wrappers while preserving external wrappers."""
+    seen = set()
+    while (
+        getattr(wrapper, "_anima_adapter_mixer_wrapper", False)
+        or getattr(wrapper, "_anima_adapter_anchor_sigma_wrapper", False)
+    ):
+        if wrapper is None:
+            break
+        marker = id(wrapper)
+        if marker in seen:
+            break
+        seen.add(marker)
+        if getattr(wrapper, "_anima_adapter_mixer_wrapper", False):
+            wrapper = getattr(wrapper, "_anima_adapter_mixer_previous", None)
+        else:
+            wrapper = getattr(wrapper, "_anima_adapter_anchor_sigma_previous", None)
     return wrapper

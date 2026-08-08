@@ -6,9 +6,17 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+_MIXER_CALLBACK_KEY_PREFIX = "anima_artist_mixer_state_"
+
 
 def should_reraise(error):
     """Return True for errors that must abort sampling immediately."""
+    # ComfyUI's InterruptProcessingException (and Python's own
+    # KeyboardInterrupt/SystemExit) deliberately inherit directly from
+    # BaseException.  Never turn those control-flow signals into a Mixer
+    # fallback when a caller uses an abort-safe BaseException boundary.
+    if isinstance(error, BaseException) and not isinstance(error, Exception):
+        return True
     for name in ("OutOfMemoryError",):
         cuda_error = getattr(getattr(torch, "cuda", None), name, None)
         if cuda_error is not None and isinstance(error, cuda_error):
@@ -74,6 +82,94 @@ def tensor_cache_signature(tensor):
     )
 
 
+def tensor_value_signature(tensor):
+    """Return a small value digest for one tensor.
+
+    ``Tensor._version`` is normally enough to invalidate a cache, but writes via
+    ``tensor.data`` can leave that counter unchanged.  This digest is deliberately
+    used at an execution boundary (not on every attention call): it makes silent
+    prompt/conditioning writes invalidate the next run while keeping the hot path
+    free of a per-step GPU synchronization.
+    """
+    if tensor is None or not torch.is_tensor(tensor):
+        return None
+    try:
+        flat = tensor.detach().reshape(-1)
+        if flat.numel() == 0:
+            return (0, 0.0, 0.0, 0.0, 0.0)
+        # A full sum/squared-sum catches arbitrary in-place writes with one device
+        # reduction.  The sampled terms reduce collision risk for signed values
+        # and make the fallback useful for integer token-ID tensors as well.
+        work = flat.to(dtype=torch.float64)
+        total = float(work.sum().item())
+        squared = float(work.square().sum().item())
+        sample_count = min(64, int(work.numel()))
+        if sample_count == 1:
+            sample = work[:1]
+        else:
+            positions = torch.linspace(
+                0,
+                int(work.numel()) - 1,
+                sample_count,
+                device=work.device,
+                dtype=torch.float64,
+            ).round().to(dtype=torch.long)
+            sample = work.index_select(0, positions)
+        return (
+            int(work.numel()),
+            round(total, 7),
+            round(squared, 7),
+            round(float(sample.sum().item()), 7),
+            round(float(sample.square().sum().item()), 7),
+        )
+    except Exception:
+        return None
+
+
+def execution_tensor_signature(state, tensor):
+    """Combine structural and execution-scoped value signatures.
+
+    The memo is cleared by ``reset_run_state``.  Consequently a conditioning
+    tensor is value-checked once per sampling run, instead of synchronizing the
+    GPU for every sigma/area call.  Mutating the tensor while a run is already in
+    progress remains unsupported, as it would make the sampler input itself
+    ill-defined.
+    """
+    structural = tensor_cache_signature(tensor)
+    if tensor is None or not torch.is_tensor(tensor):
+        return structural
+    memo = state.setdefault("_execution_value_fp_memo", {})
+    key = id(tensor)
+    cached = memo.get(key)
+    if cached is not None and cached[0] == structural:
+        return (structural, cached[1])
+    value = tensor_value_signature(tensor)
+    memo[key] = (structural, value)
+    return (structural, value)
+
+
+def runtime_input_signature(state):
+    """Value-signature all Adapter inputs once for the current execution."""
+    cached = state.get("_runtime_input_signature")
+    if cached is not None:
+        return cached
+    values = []
+    for key in (
+        "raws",
+        "ids_list",
+        "t5_weights_list",
+    ):
+        values.append(tuple(
+            execution_tensor_signature(state, value)
+            for value in (state.get(key) or [])
+        ))
+    values.append(execution_tensor_signature(state, state.get("base_ids")))
+    values.append(execution_tensor_signature(state, state.get("base_t5_weights")))
+    signature = tuple(values)
+    state["_runtime_input_signature"] = signature
+    return signature
+
+
 def forward_fingerprint(state, context):
     if context is None:
         return None
@@ -96,9 +192,557 @@ def reset_run_state(state):
     state["_ema_cache"] = {}
     state["_static_cache"] = {}
     state["_ctx_fp_memo"] = {}
+    state["_execution_value_fp_memo"] = {}
+    state["_runtime_input_signature"] = None
     state["_artist_chunk_cache"] = {}
     state["_anchor_failed"] = False
     state["_adapter_anchor_failed"] = False
+    state["_embedding_mixer_failed"] = False
+    state["_warned_embedding_failure"] = False
+    state["_anchor_last_sigma"] = None
+    state["_in_anchor_run"] = False
+    state["_run_call_count"] = 0
+    state["_multigpu_call"] = False
+    state["_multigpu_dm_by_worker"] = {}
+
+
+def _sigma_value(timestep):
+    """Return the current sigma without depending on a sampler-specific shape."""
+    if timestep is None or not torch.is_tensor(timestep) or timestep.numel() == 0:
+        return None
+    try:
+        return float(timestep.detach().max().item())
+    except Exception:
+        return None
+
+
+def _model_owner_token(apply_model, owner=None):
+    """Identify the active ModelPatcher behind a model-function wrapper.
+
+    ComfyUI copies ``model_options`` when a ModelPatcher is cloned, but functions
+    stored in it are copied by reference. A closure-based wrapper can therefore
+    survive LoRA and optimization-node clones even when the effective model has
+    changed. ``pre_run`` records the active patcher on the shared model, giving
+    this node a reliable ownership boundary for its mutable state.
+    """
+    if owner is not None:
+        return ("patcher", id(owner))
+    model = getattr(apply_model, "__self__", None)
+    patcher = getattr(model, "current_patcher", None)
+    if patcher is not None:
+        return ("patcher", id(patcher))
+    if model is not None:
+        return ("model", id(model))
+    return None
+
+
+def _clear_model_bound_mixer_state(state):
+    """Discard values produced with another effective model clone."""
+    state["_artist_embedding_cache"] = {}
+    state["_mixed_context_cache"] = None
+    state["_anchor_cache"] = {}
+    state["_anchor_cache_key"] = None
+    state["_anchor_trajectory"] = None
+    state["_anchor_last_sigma"] = None
+    state["individuals"] = None
+    state["real_lens"] = None
+    state["_runtime_input_signature"] = None
+    state["_warned_trajectory_invalidated"] = False
+    state["_warned_trajectory_reuse"] = False
+
+
+def clear_mixer_run_state(state, *, interrupted=False):
+    """Release Mixer tensors and close the active execution boundary.
+
+    ComfyUI normally invokes ``on_cleanup`` after a sampling pass, but an
+    ``InterruptProcessingException`` can leave that callback pending while a
+    wrapper is unwinding.  Keep this helper idempotent so both paths can use
+    the same cleanup contract without touching the mixer math or model
+    configuration.
+    """
+    # Reuse the canonical run-state reset so newly added per-run fields do not
+    # accidentally survive an interrupt boundary.
+    reset_run_state(state)
+
+    state["_artist_embedding_cache"] = {}
+    state["_mixed_context_cache"] = None
+    state["_anchor_cache"] = {}
+    state["_anchor_cache_key"] = None
+    trajectory = state.get("_anchor_trajectory")
+    preserve_ready_trajectory = (
+        not interrupted
+        and str(state.get("anchor_refresh_mode", "once")) == "warm_cache"
+        and isinstance(trajectory, dict)
+        and trajectory.get("ready", False)
+    )
+    if preserve_ready_trajectory:
+        # Warm-cache frames are CPU-owned after finalization.  Drop any
+        # in-flight GPU snapshot while retaining the reusable trajectory.
+        trajectory["last_cache"] = None
+        trajectory["active_sigma"] = None
+        trajectory["active_device"] = None
+        trajectory["active_dtype"] = None
+        state["_anchor_trajectory"] = trajectory
+    else:
+        state["_anchor_trajectory"] = None
+    state["_anchor_last_sigma"] = None
+    state["_in_anchor_run"] = False
+    state["individuals"] = None
+    state["real_lens"] = None
+
+    # Drop execution-scoped tensors/signatures and all flags that could make a
+    # following run observe the interrupted pass as still active.
+    state["_ctx_fp_memo"] = {}
+    state["_execution_value_fp_memo"] = {}
+    state["_runtime_input_signature"] = None
+    state["_run_last_sigma"] = None
+    state["_run_call_count"] = 0
+    state["_run_active"] = False
+    state["_last_run_had_calls"] = False
+    state["_mixer_run_start_pending"] = False
+    state["_adapter_mixer_run_start"] = None
+    state["_adapter_mixer_finalize_warm_cache"] = False
+    state["current_sigma"] = None
+
+    if interrupted:
+        # Aimdo/VBAR can have outstanding work on an offload stream when a
+        # prompt is interrupted.  Synchronize only on this exceptional path;
+        # normal per-step sampling remains asynchronous.
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        except BaseException:
+            logger.debug(
+                "[AnimaAdapterMixer] CUDA synchronization during abort cleanup "
+                "failed; preserving the original sampling exception.",
+                exc_info=True,
+            )
+
+
+def _diffusion_model_for_patcher(patcher, fallback=None):
+    if patcher is not None:
+        getter = getattr(patcher, "get_model_object", None)
+        if callable(getter):
+            try:
+                diffusion_model = getter("diffusion_model")
+                if diffusion_model is not None:
+                    return diffusion_model
+            except Exception:
+                pass
+        model = getattr(patcher, "model", None)
+        diffusion_model = getattr(model, "diffusion_model", None)
+        if diffusion_model is not None:
+            return diffusion_model
+    return fallback
+
+
+def active_patcher_for_apply_model(apply_model):
+    """Return the ModelPatcher owning one bound ``apply_model`` method."""
+    model = getattr(apply_model, "__self__", None)
+    return getattr(model, "current_patcher", None)
+
+
+def model_weight_patch_identity(patcher):
+    """Describe the effective LoRA/weight-patch set for one ModelPatcher.
+
+    A regular ``ModelPatcher.clone()`` intentionally shares the underlying
+    ``BaseModel``.  Consequently ``id(diffusion_model)`` is not sufficient to
+    distinguish two LoRA variants: the ModelPatcher has a new ``patches_uuid``
+    while the diffusion-model object stays the same.  Keep both UUIDs here:
+
+    * ``patches_uuid`` is the requested patch set on this clone;
+    * ``current_weight_patches_uuid`` is the patch set currently materialized
+      on the shared model.
+
+    The latter is normally identical by ``pre_run``.  Retaining it separately
+    turns a mismatch into useful diagnostics instead of silently reusing an
+    artist embedding from another LoRA state.
+    """
+    if patcher is None:
+        return None
+    requested = getattr(patcher, "patches_uuid", None)
+    model = getattr(patcher, "model", None)
+    loaded = getattr(model, "current_weight_patches_uuid", None)
+    patches = getattr(patcher, "patches", None)
+    try:
+        patch_count = len(patches) if patches is not None else None
+    except Exception:
+        patch_count = None
+    if requested is None and loaded is None and patch_count is None:
+        return None
+    return (requested, loaded, patch_count)
+
+
+def _format_weight_patch_identity(identity):
+    """Format a patch identity without assuming UUID objects are present."""
+    if identity is None:
+        return "unavailable"
+    requested, loaded, patch_count = identity
+    return (
+        f"requested={requested}, loaded={loaded}, "
+        f"patches={patch_count}"
+    )
+
+
+def diffusion_model_for_apply_model(apply_model, fallback=None):
+    """Resolve the diffusion model for the currently executing clone."""
+    return _diffusion_model_for_patcher(
+        active_patcher_for_apply_model(apply_model),
+        fallback,
+    )
+
+
+def resolve_multigpu_worker_wrapper(apply_model, options, current_wrapper):
+    """Select a clone-local wrapper when ComfyUI shares the main wrapper.
+
+    ``_calc_cond_batch_multigpu`` deliberately invokes the main
+    ``model_options['model_function_wrapper']`` with each worker clone's bound
+    ``apply_model``.  Clone callbacks give each ModelPatcher its own rebound
+    wrapper/state, so dispatching to that wrapper restores the intended
+    per-device ownership without changing ComfyUI's scheduler.
+    """
+    if (options or {}).get("_anima_mixer_worker_dispatch", False):
+        return None
+    c_dict = (options or {}).get("c") or {}
+    transformer_options = c_dict.get("transformer_options") or {}
+    if not (
+        isinstance(transformer_options, dict)
+        and transformer_options.get("multigpu_thread_device") is not None
+    ):
+        return None
+    patcher = active_patcher_for_apply_model(apply_model)
+    model_options = getattr(patcher, "model_options", None)
+    if not isinstance(model_options, dict):
+        return None
+    worker_wrapper = model_options.get("model_function_wrapper")
+    if callable(worker_wrapper) and worker_wrapper is not current_wrapper:
+        return worker_wrapper
+    return None
+
+
+def _raw_object_for_patch_path(patcher, path):
+    """Read a clone's unpatched object for an object-patch path."""
+    module_path = str(path)
+    if module_path.endswith(".forward"):
+        module_path = module_path[:-len(".forward")]
+    model = getattr(patcher, "model", None)
+    if model is None:
+        return None
+    current = model
+    try:
+        for component in module_path.split("."):
+            if component.isdigit():
+                try:
+                    current = current[int(component)]
+                    continue
+                except (IndexError, KeyError, TypeError, AttributeError):
+                    pass
+            if isinstance(current, dict):
+                current = current[component]
+            else:
+                current = getattr(current, component)
+    except Exception:
+        return None
+    return current
+
+
+def _raw_forward_for_patch_path(patcher, path):
+    """Resolve a cross-attention module's current clone-local forward."""
+    module = _raw_object_for_patch_path(patcher, path)
+    if module is None:
+        return None, None
+    try:
+        module = unwrap_cross_attn(module)
+    except Exception:
+        pass
+    forward = getattr(module, "forward", None)
+    if forward is None:
+        return module, None
+    try:
+        forward = unwrap_cross_attn_forward(module)
+    except Exception:
+        pass
+    return module, forward
+
+
+def begin_mixer_execution(
+    state,
+    apply_model,
+    timestep,
+    *,
+    owner=None,
+    explicit_run_start=False,
+    owner_token_override=None,
+):
+    """Advance Adapter Mixer state before a sampler call reads cached context.
+
+    Returns ``(is_run_start, model_owner_changed)``. The Adapter wrapper calls
+    this first; the optional Anchor sigma wrapper consumes its flags to finalize
+    a previous warm-cache trajectory at the correct point in the call chain.
+    """
+    sigma = _sigma_value(timestep)
+    active_patcher = owner
+    if active_patcher is None:
+        model = getattr(apply_model, "__self__", None)
+        active_patcher = getattr(model, "current_patcher", None)
+    owner_token = (
+        owner_token_override
+        if owner_token_override is not None
+        else _model_owner_token(apply_model, owner=active_patcher)
+    )
+    previous_owner = state.get("_model_owner_token")
+    owner_changed = owner_token is not None and previous_owner not in (None, owner_token)
+    shared_owner_token = owner_token_override is not None
+    weight_identity = model_weight_patch_identity(active_patcher)
+    previous_weight_identity = state.get("_model_weight_patch_identity")
+    weight_changed = (
+        weight_identity is not None
+        and previous_weight_identity not in (None, weight_identity)
+    )
+    if previous_owner is None and owner_token is not None:
+        state["_model_owner_token"] = owner_token
+        if not shared_owner_token:
+            state["dm_ref"] = _diffusion_model_for_patcher(
+                active_patcher,
+                state.get("dm_ref"),
+            )
+    elif owner_changed:
+        _clear_model_bound_mixer_state(state)
+        state["_model_owner_token"] = owner_token
+        if not shared_owner_token:
+            state["dm_ref"] = _diffusion_model_for_patcher(
+                active_patcher,
+                state.get("dm_ref"),
+            )
+        logger.info(
+            "[AnimaAdapterMixer] active model clone changed; discarded "
+            "model-bound embedding and Anchor caches."
+        )
+    if weight_identity is not None:
+        state["_model_weight_patch_identity"] = weight_identity
+    if weight_changed:
+        # ``ModelPatcher.clone`` shares BaseModel but ``add_patches`` changes
+        # the clone's UUID afterwards.  Do not let artist/Anchor tensors made
+        # under the old LoRA survive that otherwise invisible transition.
+        if not owner_changed:
+            _clear_model_bound_mixer_state(state)
+        logger.info(
+            "[AnimaAdapterMixer] active LoRA/weight patch set changed; "
+            "discarded model-bound embedding and Anchor caches (%s -> %s).",
+            _format_weight_patch_identity(previous_weight_identity),
+            _format_weight_patch_identity(weight_identity),
+        )
+
+    previous_sigma = state.get("_run_last_sigma")
+    pending_boundary = bool(state.pop("_mixer_run_start_pending", False))
+    already_reset = pending_boundary and not explicit_run_start
+    last_run_marker = state.get("_last_run_had_calls")
+    previous_run_had_calls = bool(
+        state.get("_run_active", False)
+        if last_run_marker is None else last_run_marker
+    )
+    if explicit_run_start:
+        is_run_start = True
+    elif pending_boundary:
+        is_run_start = True
+    else:
+        is_run_start = (
+            owner_changed
+            or weight_changed
+            or not state.get("_run_active", False)
+            or previous_sigma is None
+            or (sigma is not None and sigma > float(previous_sigma) + 1e-3)
+        )
+    if is_run_start and not already_reset:
+        # A live mixed context is only valid inside one denoising pass. A ready
+        # warm trajectory remains available and validates its full conditioning
+        # signature before the next pass is allowed to reuse it.
+        state["_mixed_context_cache"] = None
+        state["_anchor_cache"] = {}
+        state["_anchor_cache_key"] = None
+        reset_run_state(state)
+        state["_execution_index"] = int(state.get("_execution_index", 0)) + 1
+        state["_adapter_mixer_finalize_warm_cache"] = bool(
+            not owner_changed
+            and previous_run_had_calls
+            and str(state.get("anchor_refresh_mode", "once")) == "warm_cache"
+        )
+        state["_run_active"] = True
+        # ``None`` means no cleanup callback has closed the previous run yet;
+        # the sigma fallback can then use the still-active run as evidence.
+        state["_last_run_had_calls"] = None
+        if explicit_run_start:
+            # The pre_run callback has already performed the reset.  The first
+            # model-function wrapper call consumes this marker instead of
+            # treating its (possibly identical) sigma as another new run.
+            state["_mixer_run_start_pending"] = True
+
+    state["_run_last_sigma"] = sigma
+    if state.get("_run_active", False) and not explicit_run_start:
+        state["_run_call_count"] = int(state.get("_run_call_count", 0)) + 1
+    state["_adapter_mixer_run_start"] = is_run_start
+    return is_run_start, owner_changed
+
+
+def _clone_mixer_state_for_patcher(state, patcher):
+    cloned = dict(state)
+    for key in ("labels", "raws", "ids_list", "t5_weights_list", "user_weights"):
+        value = cloned.get(key)
+        if isinstance(value, list):
+            cloned[key] = list(value)
+    cloned["dm_ref"] = _diffusion_model_for_patcher(
+        patcher,
+        cloned.get("dm_ref"),
+    )
+    cloned["individuals"] = None
+    cloned["real_lens"] = None
+    _clear_model_bound_mixer_state(cloned)
+    reset_run_state(cloned)
+    cloned["_model_owner_token"] = None
+    cloned["_model_weight_patch_identity"] = None
+    cloned["_run_last_sigma"] = None
+    cloned["_run_active"] = False
+    cloned["_last_run_had_calls"] = False
+    cloned["_mixer_run_start_pending"] = False
+    cloned["_adapter_mixer_run_start"] = None
+    cloned["_adapter_mixer_finalize_warm_cache"] = False
+    cloned["_execution_index"] = 0
+    return cloned
+
+
+def _rebind_mixer_wrapper_chain(wrapper, old_state, new_state):
+    if wrapper is None:
+        return None
+    if getattr(wrapper, "_anima_mixer_state", None) is not old_state:
+        return wrapper
+    factory = getattr(wrapper, "_anima_mixer_factory", None)
+    previous = getattr(wrapper, "_anima_mixer_previous", None)
+    if not callable(factory):
+        return wrapper
+    rebound_previous = _rebind_mixer_wrapper_chain(
+        previous,
+        old_state,
+        new_state,
+    )
+    return factory(new_state, rebound_previous)
+
+
+def _rebind_mixer_object_patches(patcher, old_state, new_state):
+    registry = getattr(patcher, "object_patches", None)
+    if not hasattr(registry, "items"):
+        return
+    for path, patch in tuple(registry.items()):
+        if getattr(patch, "_anima_mixer_state", None) is not old_state:
+            continue
+        original_module, original_forward = _raw_forward_for_patch_path(
+            patcher,
+            path,
+        )
+        rebind = getattr(patch, "rebind_state", None)
+        if callable(rebind):
+            try:
+                registry[path] = rebind(
+                    new_state,
+                    original_forward=original_forward,
+                    original_module=original_module,
+                )
+            except TypeError:
+                # Keep compatibility with older local patch objects while all
+                # current Mixer patches use the clone-local forward above.
+                registry[path] = rebind(new_state)
+
+
+def _mixer_callback_key(state):
+    return f"{_MIXER_CALLBACK_KEY_PREFIX}{id(state):x}"
+
+
+def _replace_mixer_lifecycle_callbacks(patcher, state, callback_key):
+    remove = getattr(patcher, "remove_callbacks_with_key", None)
+    add = getattr(patcher, "add_callback_with_key", None)
+    if not callable(remove) or not callable(add):
+        return
+    remove("on_clone", callback_key)
+    remove("on_pre_run", callback_key)
+    remove("on_cleanup", callback_key)
+    add("on_clone", callback_key, _make_mixer_clone_callback(state, callback_key))
+    add("on_pre_run", callback_key, _make_mixer_pre_run_callback(state))
+    add("on_cleanup", callback_key, _make_mixer_cleanup_callback(state))
+
+
+def _make_mixer_clone_callback(state, callback_key):
+    def _on_clone(_source, cloned):
+        new_state = _clone_mixer_state_for_patcher(state, cloned)
+        options = getattr(cloned, "model_options", None)
+        if isinstance(options, dict):
+            wrapper = options.get("model_function_wrapper")
+            rebound = _rebind_mixer_wrapper_chain(wrapper, state, new_state)
+            if rebound is not wrapper:
+                options["model_function_wrapper"] = rebound
+        _rebind_mixer_object_patches(cloned, state, new_state)
+        _replace_mixer_lifecycle_callbacks(cloned, new_state, callback_key)
+    return _on_clone
+
+
+def _make_mixer_pre_run_callback(state):
+    def _on_pre_run(patcher):
+        begin_mixer_execution(
+            state,
+            getattr(getattr(patcher, "model", None), "apply_model", None),
+            None,
+            owner=patcher,
+            explicit_run_start=True,
+        )
+        identity = state.get("_model_weight_patch_identity")
+        logger.info(
+            "[AnimaAdapterMixer] run=%d patcher=%x %s",
+            int(state.get("_execution_index", 0)),
+            id(patcher),
+            _format_weight_patch_identity(identity),
+        )
+        if identity is not None and identity[0] is not None and identity[1] is not None:
+            if identity[0] != identity[1]:
+                logger.warning(
+                    "[AnimaAdapterMixer] requested and loaded patch UUIDs differ at "
+                    "pre_run; Mixer caches were cleared, but this run may be using an "
+                    "incomplete model reload (%s).",
+                    _format_weight_patch_identity(identity),
+                )
+    return _on_pre_run
+
+
+def _make_mixer_cleanup_callback(state):
+    def _on_cleanup(_patcher):
+        had_calls = int(
+            state.get("_run_call_count", 0)
+        ) > 0
+        clear_mixer_run_state(state)
+        # This marker is historical boundary information, not live run state;
+        # retain it so the next sigma fallback still recognizes a prior pass.
+        state["_last_run_had_calls"] = had_calls
+    return _on_cleanup
+
+
+def register_mixer_lifecycle(patcher, state):
+    """Bind Mixer state to ModelPatcher clone and sampling boundaries.
+
+    ComfyUI's clone path copies callback registries and calls ``on_clone`` after
+    the clone's model options/object-patch registries have been copied.  We use
+    that hook to give each clone independent mutable Mixer state, then use
+    ``on_pre_run`` as the authoritative run boundary.  Older test doubles or
+    ComfyUI forks without these callbacks keep the sigma-based fallback.
+    """
+    get_callbacks = getattr(patcher, "get_callbacks", None)
+    add = getattr(patcher, "add_callback_with_key", None)
+    if not callable(get_callbacks) or not callable(add):
+        return False
+    callback_key = _mixer_callback_key(state)
+    if not get_callbacks("on_clone", callback_key):
+        add("on_clone", callback_key, _make_mixer_clone_callback(state, callback_key))
+    if not get_callbacks("on_pre_run", callback_key):
+        add("on_pre_run", callback_key, _make_mixer_pre_run_callback(state))
+    if not get_callbacks("on_cleanup", callback_key):
+        add("on_cleanup", callback_key, _make_mixer_cleanup_callback(state))
+    return True
 
 
 def extract_conditioning(conditioning):
@@ -133,6 +777,23 @@ class CrossAttnForwardPatch:
     def __init__(self, wrapper):
         self.wrapper = wrapper
         self.original_forward = wrapper.original
+        self._anima_mixer_state = getattr(wrapper, "_st", None)
+
+    def rebind_state(
+        self,
+        state,
+        original_forward=None,
+        original_module=None,
+    ):
+        rebind = getattr(self.wrapper, "rebind_state", None)
+        if callable(rebind):
+            wrapper = rebind(
+                state,
+                original_forward=original_forward,
+                original_module=original_module,
+            )
+            return CrossAttnForwardPatch(wrapper)
+        return self
 
     def __call__(self, *args, **kwargs):
         return self.wrapper.forward(*args, **kwargs)
@@ -140,8 +801,16 @@ class CrossAttnForwardPatch:
 
 def unwrap_cross_attn_forward(ca):
     forward = getattr(ca, "forward", None)
-    while isinstance(forward, CrossAttnForwardPatch):
-        forward = forward.original_forward
+    seen = set()
+    while (
+        isinstance(forward, CrossAttnForwardPatch)
+        or getattr(forward, "_anima_adapter_anchor_q_forward_patch", False)
+    ):
+        marker = id(forward)
+        if marker in seen:
+            break
+        seen.add(marker)
+        forward = getattr(forward, "original_forward", None)
     return forward
 
 
@@ -188,17 +857,19 @@ def preprocess_one(dm, raw, ids, weights, target_device, target_dtype):
         return dm.preprocess_text_embeds(raw_b, ids_b, t5xxl_weights=weights_b)
 
 
-def build_artists(state, ref_context):
-    if state.get("individuals") is not None:
+def build_artists(state, ref_context, dm=None):
+    dm = state["dm_ref"] if dm is None else dm
+    cacheable = not state.get("_multigpu_call", False)
+    if cacheable and state.get("individuals") is not None:
         return state["individuals"], state["real_lens"]
-    dm = state["dm_ref"]
     individuals, real_lens = [], []
     for raw, ids, w_t in zip(state["raws"], state["ids_list"], state["w_list"]):
         artist = preprocess_one(dm, raw, ids, w_t, ref_context.device, ref_context.dtype)
         individuals.append(artist)
         real_lens.append(int(ids.shape[-1]) if ids is not None else artist.shape[1])
-    state["individuals"] = individuals
-    state["real_lens"] = real_lens
+    if cacheable:
+        state["individuals"] = individuals
+        state["real_lens"] = real_lens
     return individuals, real_lens
 
 

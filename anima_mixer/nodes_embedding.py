@@ -1,6 +1,7 @@
 """ComfyUI node for model-boundary post-adapter artist mixing."""
 
 import logging
+import secrets
 
 from .adapter_anchor import make_adapter_anchor_q_forward_patch
 from .alignment import build_base_anchored_plan
@@ -11,6 +12,7 @@ from .constants import (
     ANCHOR_CACHE_POINTS_DEFAULT,
     ANCHOR_CACHE_POINTS_MAX,
     ANCHOR_CACHE_POINTS_MIN,
+    ANCHOR_SEED_MAX,
     ANCHOR_KEYFRAME_MODES,
     ANCHOR_KEYFRAME_UNIFORM_SIGMA,
     ANCHOR_LAYER_THRESHOLD_DISABLED,
@@ -20,16 +22,49 @@ from .constants import (
     WEIGHT_MAX,
     WEIGHT_MIN,
 )
-from .embedding import make_adapter_embedding_wrapper
+from .embedding import (
+    make_adapter_embedding_wrapper,
+    unwrap_adapter_embedding_wrapper,
+)
 from .parsing import parse_anchor_seed_list
 from .patching import (
     extract_conditioning,
+    register_mixer_lifecycle,
+    tensor_cache_signature,
     unwrap_cross_attn,
     unwrap_cross_attn_forward,
     validate_model,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _build_cache_namespace(
+    artist_pack,
+    labels,
+    raws,
+    ids_list,
+    t5_weights_list,
+    base_ids,
+    base_t5_weights,
+    user_weights,
+    normalize_weights,
+    alignment_mode,
+):
+    """Identify the prompt/artist inputs represented by one Mixer state."""
+    return (
+        "anima_adapter_mixer_v2",
+        str(alignment_mode),
+        str(artist_pack.get("base_prompt", "")),
+        tuple(str(label) for label in labels),
+        tuple(round(float(weight), 7) for weight in user_weights),
+        bool(normalize_weights),
+        tuple(tensor_cache_signature(value) for value in raws),
+        tuple(tensor_cache_signature(value) for value in ids_list),
+        tuple(tensor_cache_signature(value) for value in t5_weights_list),
+        tensor_cache_signature(base_ids),
+        tensor_cache_signature(base_t5_weights),
+    )
 
 
 class AnimaArtistAdapterMixer:
@@ -120,16 +155,17 @@ class AnimaArtistAdapterMixer:
             advanced.get("anchor_seed_list", ""),
             ANCHOR_SEEDS_MAX,
         )
-        if artist_anchor_q and not anchor_seed_list:
-            raise ValueError(
-                "[AnimaAdapterMixer] Q-only Anchor requires at least one resolved "
-                "anchor seed. Connect Anima Artist Options (Advanced) so an empty "
-                "anchor_seed_list can generate seeds automatically."
-            )
         anchor_seeds_count = max(
             1,
             min(int(advanced.get("anchor_seeds_count", 1)), ANCHOR_SEEDS_MAX),
         )
+        if artist_anchor_q and not anchor_seed_list:
+            generated = []
+            while len(generated) < anchor_seeds_count:
+                seed = secrets.randbelow(ANCHOR_SEED_MAX + 1)
+                if seed not in generated:
+                    generated.append(seed)
+            anchor_seed_list = generated
         anchor_user_blend = max(
             0.0,
             min(1.0, float(advanced.get("anchor_user_blend", 0.0))),
@@ -256,6 +292,33 @@ class AnimaArtistAdapterMixer:
             user_weights = [1.0] * len(raws)
 
         m = model.clone()
+        # Use the clone-local Adapter model for state and Anchor patch
+        # construction.  This matters for ComfyUI's fresh-model
+        # deepclone_multigpu path, where the source ``dm`` is on another GPU.
+        try:
+            dm = m.get_model_object("diffusion_model")
+        except Exception:
+            dm = m.model.diffusion_model
+        existing_patches = getattr(m, "object_patches", None) or {}
+        for path, patch in list(existing_patches.items()):
+            if (
+                str(path).endswith(".cross_attn.forward")
+                and getattr(patch, "_anima_adapter_anchor_q_forward_patch", False)
+            ):
+                existing_patches.pop(path, None)
+
+        cache_namespace = _build_cache_namespace(
+            artist_pack,
+            labels,
+            raws,
+            ids_list,
+            t5_weights_list,
+            base_ids,
+            base_t5_weights,
+            user_weights,
+            normalize_weights,
+            alignment_mode,
+        )
         state = {
             "enabled": True,
             "dm_ref": dm,
@@ -269,6 +332,7 @@ class AnimaArtistAdapterMixer:
             "normalize_weights": bool(normalize_weights),
             "alignment_mode": alignment_mode,
             "alignment_plan": alignment_plan,
+            "_cache_namespace": cache_namespace,
             "strength": strength,
             "apply_to_uncond": apply_to_uncond,
             "uncond_strength": max(0.0, min(1.0, float(uncond_strength))),
@@ -301,9 +365,10 @@ class AnimaArtistAdapterMixer:
             "_warned_adapter_anchor_failure": False,
             "_warned_trajectory_invalidated": False,
             "_warned_trajectory_reuse": False,
+            "_model_owner_token": None,
+            "_execution_index": 0,
         }
 
-        existing_patches = getattr(m, "object_patches", None) or {}
         existing_cross_attn = [
             str(path)
             for path in existing_patches
@@ -321,7 +386,9 @@ class AnimaArtistAdapterMixer:
                 "performing an A/B comparison."
             )
 
-        prev_wrapper = m.model_options.get("model_function_wrapper")
+        prev_wrapper = unwrap_adapter_embedding_wrapper(
+            m.model_options.get("model_function_wrapper")
+        )
         if artist_anchor_q:
             # Adapter mixing runs first so the anchor pre-run sees exactly the
             # same post-Adapter mixed context as the user denoising pass.
@@ -357,6 +424,8 @@ class AnimaArtistAdapterMixer:
                 anchor_cache_points,
                 anchor_keyframe_mode,
             )
+
+        register_mixer_lifecycle(m, state)
 
         if alignment_mode == ALIGN_BASE_ANCHORED:
             imperfect = [

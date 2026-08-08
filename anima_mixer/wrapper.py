@@ -19,6 +19,7 @@ from .parsing import normalize_weights
 from .patching import (
     broadcast_batch,
     build_artists,
+    clear_mixer_run_state,
     forward_fingerprint,
     in_sigma_range,
     in_stabilizer_window,
@@ -49,6 +50,20 @@ class CrossAttnWrapper(nn.Module):
         self._st = shared_state
         self._idx = layer_idx
 
+    def rebind_state(
+        self,
+        shared_state,
+        original_forward=None,
+        original_module=None,
+    ):
+        """Create a clone-local wrapper without sharing mutable run state."""
+        return type(self)(
+            self.original if original_forward is None else original_forward,
+            shared_state,
+            self._idx,
+            self.original_module if original_module is None else original_module,
+        )
+
     def _warn_no_sigma(self):
         if not self._st.get("_warned_no_sigma", False):
             logger.warning(
@@ -67,6 +82,8 @@ class CrossAttnWrapper(nn.Module):
         self._st["_ema_last_sigma"] = cur
 
     def _apply_ema(self, artist_total, fusion_mode, fp=None):
+        if self._st.get("_multigpu_call", False):
+            return artist_total
         if self._st.get("artist_static_capture", False):
             return artist_total
         ema_alpha = float(self._st.get("artist_ema_alpha", 0.0))
@@ -100,6 +117,10 @@ class CrossAttnWrapper(nn.Module):
     def _get_artist_outputs_with_cache(self, x, context, rope_emb, t_opts,
                                        individuals, fusion_mode, fp=None,
                                        extra_fp=None):
+        if self._st.get("_multigpu_call", False):
+            return self._collect_artist_outputs(
+                x, context, rope_emb, t_opts, individuals, fusion_mode
+            )
         if not self._st.get("artist_static_capture", False):
             return self._collect_artist_outputs(
                 x, context, rope_emb, t_opts, individuals, fusion_mode
@@ -241,6 +262,14 @@ class CrossAttnWrapper(nn.Module):
     def forward(self, x, context=None, rope_emb=None, transformer_options=None):
         st = self._st
         transformer_options = transformer_options or {}
+        if (
+            isinstance(transformer_options, dict)
+            and transformer_options.get("multigpu_thread_device") is not None
+        ):
+            # MultiGPU workers share the main model-options wrapper.  Disable
+            # stateful EMA/static/Anchor-Q reuse for that run rather than racing
+            # one device's cache against another device's call.
+            st["_multigpu_call"] = True
 
         if st.get("_in_anchor_run", False):
             cache = st.setdefault("_anchor_cache", {})
@@ -270,8 +299,9 @@ class CrossAttnWrapper(nn.Module):
 
         try:
             return self._dispatch(x, context, rope_emb, transformer_options)
-        except Exception as e:
+        except BaseException as e:
             if should_reraise(e):
+                clear_mixer_run_state(st, interrupted=True)
                 raise
             logger.exception(
                 "[AnimaCrossAttn] L%d injection failed; this layer falls back "
@@ -286,7 +316,14 @@ class CrossAttnWrapper(nn.Module):
 
     def _dispatch(self, x, context, rope_emb, transformer_options):
         st = self._st
-        individuals, _ = build_artists(st, context)
+        dm = None
+        if st.get("_multigpu_call", False):
+            device_key = (
+                getattr(context.device, "type", None),
+                getattr(context.device, "index", None),
+            )
+            dm = (st.get("_multigpu_dm_by_worker") or {}).get(device_key)
+        individuals, _ = build_artists(st, context, dm=dm)
         combine_mode = st["combine_mode"]
         fusion_mode = st["fusion_mode"]
         strength = float(st["strength"])
@@ -363,8 +400,9 @@ class CrossAttnWrapper(nn.Module):
                 artist_total = self._batched_artists_forward(
                     q_x, context, rope_emb, t_opts, individuals, ws, fusion_mode,
                 )
-            except Exception as e:
+            except BaseException as e:
                 if should_reraise(e):
+                    clear_mixer_run_state(self._st, interrupted=True)
                     raise
                 if not self._st.get("_warned_batched", False):
                     logger.warning(
@@ -417,6 +455,8 @@ class CrossAttnWrapper(nn.Module):
 
     def _get_anchor_q_x(self, x):
         st = self._st
+        if st.get("_multigpu_call", False):
+            return x
         if not st.get("artist_anchor_q", False):
             return x
         if st.get("_anchor_failed", False):
@@ -460,8 +500,9 @@ class CrossAttnWrapper(nn.Module):
                 return self._batched_artists_outputs_only(
                     q_x, context, rope_emb, t_opts, individuals, fusion_mode,
                 )
-            except Exception as e:
+            except BaseException as e:
                 if should_reraise(e):
+                    clear_mixer_run_state(self._st, interrupted=True)
                     raise
                 if not self._st.get("_warned_batched", False):
                     logger.warning(
@@ -619,8 +660,9 @@ class CrossAttnWrapper(nn.Module):
                             "the standard attention path remains active."
                         )
                     return reference
-                except Exception as e:
+                except BaseException as e:
                     if should_reraise(e):
+                        clear_mixer_run_state(self._st, interrupted=True)
                         raise
                     validation[module_type] = False
                     logger.warning(
@@ -696,8 +738,9 @@ class CrossAttnWrapper(nn.Module):
         if k < n:
             try:
                 rows = lowrank_rows_deterministic(rows, k)
-            except Exception as e:
+            except BaseException as e:
                 if should_reraise(e):
+                    clear_mixer_run_state(self._st, interrupted=True)
                     raise
                 if not self._st.get("_warned_svd", False):
                     logger.warning(

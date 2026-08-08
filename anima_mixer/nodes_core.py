@@ -26,6 +26,7 @@ from .parsing import (
 from .patching import (
     extract_conditioning,
     make_cross_attn_forward_patch,
+    register_mixer_lifecycle,
     unwrap_cross_attn,
     unwrap_cross_attn_forward,
     validate_model,
@@ -404,6 +405,15 @@ class AnimaArtistCrossAttn:
                 )
 
         m = model.clone()
+        # Resolve all model-bound references from the returned patcher.  A
+        # normal clone usually shares the model object, while a later
+        # deepclone_multigpu() supplies a fresh diffusion model; keeping the
+        # source model's bound methods here would make worker patches call the
+        # wrong attention module.
+        try:
+            dm = m.get_model_object("diffusion_model")
+        except Exception:
+            dm = m.model.diffusion_model
         state = {
             "enabled": bool(enabled),
             "fusion_mode": fusion_mode,
@@ -495,5 +505,7 @@ class AnimaArtistCrossAttn:
                 f"diffusion_model.blocks.{i}.cross_attn.forward",
                 make_cross_attn_forward_patch(wrapper),
             )
+
+        register_mixer_lifecycle(m, state)
 
         return (m, base_cond_out)

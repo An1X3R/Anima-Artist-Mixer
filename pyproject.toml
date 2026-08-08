@@ -1,7 +1,7 @@
 [project]
 name = "anima-artist-mixer"
 description = "Multi-artist mixing for Anima through cross-attention or post-adapter embedding projection."
-version = "26.8.2"
+version = "26.8.3"
 license = { file = "LICENSE" }
 dependencies = []
 readme = "README.md"

@@ -2,6 +2,12 @@
 
 A ComfyUI custom node for **multi-artist mixing** on Anima models. It encodes each artist separately, then mixes either cross-attention outputs or post-adapter embeddings, avoiding the prompt-side artist interference caused by Anima's LLM text encoder.
 
+## New in 26.8.3: Interrupt and cache-state cleanup
+
+This maintenance release hardens Mixer state across interrupted sampling, model clones, dynamic VRAM/offload, LoRA changes, and multi-GPU wrapper paths. It clears stale GPU-side Mixer state at execution boundaries and treats interrupt control-flow correctly, while keeping the existing Cross-Attn and Adapter mixing interfaces and math unchanged.
+
+The black-image/noise failure addressed here was observed in testing with RTX 50-series hardware combined with dynamic VRAM/offload and interrupted sampling followed by LoRA changes. Other hardware has not been confirmed to expose the same failure, so this should be read as a compatibility note rather than a hardware-specific guarantee.
+
 ## New in 26.8.2: Automatic Adapter Anchor Seeds
 
 The Adapter Mixer's Q-only Anchor once again accepts an empty `anchor_seed_list`. In that mode, `anchor_seeds_count` generates fresh random anchor seeds on every execution so users can explore different style references. Entering one or more fixed seeds still provides repeatable cross-run stabilization and allows `once` or `warm_cache` data to be reused while the cache key remains unchanged.
