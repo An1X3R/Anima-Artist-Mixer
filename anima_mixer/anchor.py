@@ -17,12 +17,14 @@ from .constants import (
     ANCHOR_SEEDS_POOL,
 )
 from .patching import (
+    adapter_mixer_state_is_active,
     begin_mixer_execution,
     clear_mixer_run_state,
     context_fingerprint,
     diffusion_model_for_apply_model,
     execution_tensor_signature,
     in_stabilizer_window,
+    resolve_clone_local_mixer_wrapper,
     resolve_multigpu_worker_wrapper,
     should_reraise,
 )
@@ -513,7 +515,22 @@ def _run_or_load_warm_anchor(state, user_x, user_timestep, c_dict, apply_model, 
 
 
 def make_sigma_capture(state, prev_wrapper):
-    def wrapper(apply_model, options):
+    def _wrapper_body(apply_model, options):
+        if not adapter_mixer_state_is_active(state, apply_model=apply_model):
+            if prev_wrapper is not None:
+                return prev_wrapper(apply_model, options)
+            return apply_model(
+                options["input"],
+                options["timestep"],
+                **options["c"],
+            )
+        clone_wrapper = resolve_clone_local_mixer_wrapper(
+            apply_model,
+            wrapper,
+            state,
+        )
+        if clone_wrapper is not None:
+            return clone_wrapper(apply_model, options)
         ts = options.get("timestep")
         user_ts = ts
         c_dict = options.get("c", {}) or {}
@@ -641,6 +658,17 @@ def make_sigma_capture(state, prev_wrapper):
             if prev_wrapper is not None:
                 return prev_wrapper(apply_model, options)
             return apply_model(options["input"], options["timestep"], **options["c"])
+        except BaseException as error:
+            if should_reraise(error):
+                clear_mixer_run_state(state, interrupted=True)
+            raise
+
+    def wrapper(apply_model, options):
+        # Sigma capture has early clone/multi-GPU and run-boundary work before
+        # its underlying-forward try block. Cover those paths with the same
+        # abort cleanup contract as the Adapter embedding wrapper.
+        try:
+            return _wrapper_body(apply_model, options)
         except BaseException as error:
             if should_reraise(error):
                 clear_mixer_run_state(state, interrupted=True)

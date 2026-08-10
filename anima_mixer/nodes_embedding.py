@@ -30,6 +30,7 @@ from .parsing import parse_anchor_seed_list
 from .patching import (
     extract_conditioning,
     register_mixer_lifecycle,
+    select_active_adapter_mixer,
     tensor_cache_signature,
     unwrap_cross_attn,
     unwrap_cross_attn_forward,
@@ -367,6 +368,8 @@ class AnimaArtistAdapterMixer:
             "_warned_trajectory_reuse": False,
             "_model_owner_token": None,
             "_execution_index": 0,
+            "_adapter_mixer_instance_token": secrets.token_hex(16),
+            "_adapter_mixer_selected_for_run": None,
         }
 
         existing_cross_attn = [
@@ -397,6 +400,7 @@ class AnimaArtistAdapterMixer:
         else:
             final_wrapper = make_adapter_embedding_wrapper(state, prev_wrapper)
         m.set_model_unet_function_wrapper(final_wrapper)
+        select_active_adapter_mixer(m, state)
 
         if artist_anchor_q:
             for layer_index in range(anchor_block_count):

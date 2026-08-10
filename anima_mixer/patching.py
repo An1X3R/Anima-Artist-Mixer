@@ -1,5 +1,6 @@
 """Model validation, patch bookkeeping, conditioning, and CFG helpers."""
 
+import functools
 import logging
 
 import torch
@@ -7,6 +8,11 @@ import torch
 logger = logging.getLogger(__name__)
 
 _MIXER_CALLBACK_KEY_PREFIX = "anima_artist_mixer_state_"
+_ACTIVE_ADAPTER_MIXER_TOKEN_KEY = "_anima_adapter_mixer_active_token"
+
+
+class MixerFatalError(RuntimeError):
+    """A Mixer failure after which the current sampling pass must stop."""
 
 
 def should_reraise(error):
@@ -17,12 +23,35 @@ def should_reraise(error):
     # fallback when a caller uses an abort-safe BaseException boundary.
     if isinstance(error, BaseException) and not isinstance(error, Exception):
         return True
-    for name in ("OutOfMemoryError",):
+    if isinstance(error, MixerFatalError):
+        return True
+    for name in ("OutOfMemoryError", "AcceleratorError"):
         cuda_error = getattr(getattr(torch, "cuda", None), name, None)
         if cuda_error is not None and isinstance(error, cuda_error):
             return True
         torch_error = getattr(torch, name, None)
         if torch_error is not None and isinstance(error, torch_error):
+            return True
+    for name in ("CudaError", "DeferredCudaCallError"):
+        cuda_error = getattr(getattr(torch, "cuda", None), name, None)
+        if cuda_error is not None and isinstance(error, cuda_error):
+            return True
+    if isinstance(error, RuntimeError):
+        message = str(error).lower()
+        accelerator_markers = (
+            "cuda error",
+            "cuda runtime",
+            "device-side assert",
+            "illegal memory access",
+            "misaligned address",
+            "launch failure",
+            "cublas",
+            "cudnn",
+            "cusparse",
+            "nvrtc",
+            "triton",
+        )
+        if any(marker in message for marker in accelerator_markers):
             return True
     try:
         from comfy.model_management import InterruptProcessingException
@@ -148,6 +177,19 @@ def execution_tensor_signature(state, tensor):
     return (structural, value)
 
 
+def refresh_runtime_input_signature(state):
+    """Re-read conditioning values at a known execution boundary.
+
+    A tensor can be changed through ``.data`` without changing its id or
+    ``_version``.  The normal execution path memoizes the value digest for
+    speed, so an abort boundary must explicitly invalidate that memo before
+    comparing the next run's inputs.
+    """
+    state["_execution_value_fp_memo"] = {}
+    state["_runtime_input_signature"] = None
+    return runtime_input_signature(state)
+
+
 def runtime_input_signature(state):
     """Value-signature all Adapter inputs once for the current execution."""
     cached = state.get("_runtime_input_signature")
@@ -204,6 +246,7 @@ def reset_run_state(state):
     state["_run_call_count"] = 0
     state["_multigpu_call"] = False
     state["_multigpu_dm_by_worker"] = {}
+    state["_interrupt_cleanup_complete"] = False
 
 
 def _sigma_value(timestep):
@@ -260,6 +303,11 @@ def clear_mixer_run_state(state, *, interrupted=False):
     the same cleanup contract without touching the mixer math or model
     configuration.
     """
+    if interrupted and state.get("_interrupt_cleanup_complete", False):
+        return
+
+    previous_input_signature = state.get("_runtime_input_signature")
+
     # Reuse the canonical run-state reset so newly added per-run fields do not
     # accidentally survive an interrupt boundary.
     reset_run_state(state)
@@ -295,6 +343,11 @@ def clear_mixer_run_state(state, *, interrupted=False):
     state["_ctx_fp_memo"] = {}
     state["_execution_value_fp_memo"] = {}
     state["_runtime_input_signature"] = None
+    if not interrupted and previous_input_signature is not None:
+        # Keep one completed-run fingerprint so a reused wrapper can detect
+        # prompt tensors changed in place even when ComfyUI did not interrupt.
+        state["_boundary_input_signature"] = previous_input_signature
+        state["_force_boundary_check"] = True
     state["_run_last_sigma"] = None
     state["_run_call_count"] = 0
     state["_run_active"] = False
@@ -305,6 +358,9 @@ def clear_mixer_run_state(state, *, interrupted=False):
     state["current_sigma"] = None
 
     if interrupted:
+        state["_abort_input_signature"] = previous_input_signature
+        state["_force_boundary_check"] = True
+        state["_interrupt_cleanup_complete"] = True
         # Aimdo/VBAR can have outstanding work on an offload stream when a
         # prompt is interrupted.  Synchronize only on this exceptional path;
         # normal per-step sampling remains asynchronous.
@@ -340,6 +396,51 @@ def active_patcher_for_apply_model(apply_model):
     """Return the ModelPatcher owning one bound ``apply_model`` method."""
     model = getattr(apply_model, "__self__", None)
     return getattr(model, "current_patcher", None)
+
+
+def adapter_mixer_state_is_active(state, apply_model=None, patcher=None):
+    """Return whether ``state`` is the Adapter Mixer selected by this patcher.
+
+    A later sampling stage can receive a model whose older Mixer is hidden
+    inside an opaque Sage/FBCache/control wrapper.  That wrapper cannot be
+    reconstructed safely, so the old Mixer closure remains reachable.  The
+    clone-local token makes it a pass-through without mutating sibling model
+    branches that still legitimately use the older Mixer.
+
+    Cross-Attn Mixer states do not carry an Adapter token and remain unaffected.
+    """
+    token = state.get("_adapter_mixer_instance_token")
+    if token is None:
+        return True
+    if patcher is None and apply_model is not None:
+        patcher = active_patcher_for_apply_model(apply_model)
+    options = getattr(patcher, "model_options", None)
+    if not isinstance(options, dict):
+        # A third-party callable may hide the bound ``apply_model`` method.
+        # Once ComfyUI has established the run boundary, use that local
+        # selection marker instead of fail-open executing a superseded state.
+        selected = state.get("_adapter_mixer_selected_for_run")
+        return True if selected is None else bool(selected)
+    active_token = options.get(_ACTIVE_ADAPTER_MIXER_TOKEN_KEY)
+    return active_token is None or active_token == token
+
+
+def select_active_adapter_mixer(patcher, state):
+    """Select one Adapter Mixer for a clone-local ModelPatcher branch."""
+    options = getattr(patcher, "model_options", None)
+    if not isinstance(options, dict):
+        return False
+    token = state.get("_adapter_mixer_instance_token")
+    if token is None:
+        return False
+    previous = options.get(_ACTIVE_ADAPTER_MIXER_TOKEN_KEY)
+    options[_ACTIVE_ADAPTER_MIXER_TOKEN_KEY] = token
+    if previous not in (None, token):
+        logger.info(
+            "[AnimaAdapterMixer] selected a newer Adapter Mixer for this "
+            "patcher; older hidden Mixer wrappers will pass through."
+        )
+    return True
 
 
 def model_weight_patch_identity(patcher):
@@ -499,6 +600,31 @@ def begin_mixer_execution(
         weight_identity is not None
         and previous_weight_identity not in (None, weight_identity)
     )
+    previous_input_signature = state.pop(
+        "_abort_input_signature",
+        state.pop(
+            "_boundary_input_signature",
+            state.get("_runtime_input_signature"),
+        ),
+    )
+    fresh_input_signature = None
+    conditioning_changed = False
+    # ``on_pre_run`` is the authoritative ComfyUI execution boundary.  A
+    # previous interrupted pass is normally followed by ``on_cleanup``, but
+    # outer sampler/wrapper paths can unwind before that callback is reached.
+    # In that case the old execution-value memo would otherwise be reused and
+    # an in-place prompt/conditioning edit could look unchanged.  Re-read the
+    # value fingerprints once for every explicit pre-run; ordinary sigma calls
+    # still use the memo and remain synchronization-free.
+    boundary_check_requested = bool(state.pop("_force_boundary_check", False))
+    if explicit_run_start:
+        boundary_check_requested = True
+    if boundary_check_requested:
+        fresh_input_signature = refresh_runtime_input_signature(state)
+        conditioning_changed = (
+            previous_input_signature is not None
+            and fresh_input_signature != previous_input_signature
+        )
     if previous_owner is None and owner_token is not None:
         state["_model_owner_token"] = owner_token
         if not shared_owner_token:
@@ -532,6 +658,23 @@ def begin_mixer_execution(
             _format_weight_patch_identity(previous_weight_identity),
             _format_weight_patch_identity(weight_identity),
         )
+    if conditioning_changed:
+        _clear_model_bound_mixer_state(state)
+        if str(state.get("alignment_mode", "")) == "base_anchored":
+            # ComfyUI can reuse the same model wrapper while replacing prompt
+            # tensors after an interrupted queue item.  The Adapter caches are
+            # already invalidated above, but their token-row map must follow the
+            # new IDs as well or a different-length prompt reuses stale indices.
+            from .alignment import build_base_anchored_plan
+            state["alignment_plan"] = build_base_anchored_plan(
+                state.get("base_ids"),
+                state.get("ids_list") or [],
+            )
+        logger.info(
+            "[AnimaAdapterMixer] conditioning value changed after an abort; "
+            "discarded artist, mixed-context, and Anchor caches and refreshed "
+            "token alignment."
+        )
 
     previous_sigma = state.get("_run_last_sigma")
     pending_boundary = bool(state.pop("_mixer_run_start_pending", False))
@@ -549,6 +692,7 @@ def begin_mixer_execution(
         is_run_start = (
             owner_changed
             or weight_changed
+            or conditioning_changed
             or not state.get("_run_active", False)
             or previous_sigma is None
             or (sigma is not None and sigma > float(previous_sigma) + 1e-3)
@@ -578,6 +722,10 @@ def begin_mixer_execution(
             state["_mixer_run_start_pending"] = True
 
     state["_run_last_sigma"] = sigma
+    if fresh_input_signature is not None:
+        # Preserve the boundary fingerprint across reset_run_state(); the next
+        # cache lookup can then use it without another full value reduction.
+        state["_runtime_input_signature"] = fresh_input_signature
     if state.get("_run_active", False) and not explicit_run_start:
         state["_run_call_count"] = int(state.get("_run_call_count", 0)) + 1
     state["_adapter_mixer_run_start"] = is_run_start
@@ -606,8 +754,93 @@ def _clone_mixer_state_for_patcher(state, patcher):
     cloned["_mixer_run_start_pending"] = False
     cloned["_adapter_mixer_run_start"] = None
     cloned["_adapter_mixer_finalize_warm_cache"] = False
+    cloned["_adapter_mixer_selected_for_run"] = None
     cloned["_execution_index"] = 0
+    cloned["_force_boundary_check"] = True
+    cloned["_boundary_input_signature"] = None
+    cloned.pop("_abort_input_signature", None)
     return cloned
+
+
+def _iter_nested_objects(root, max_depth=32):
+    """Walk callable closures/attributes without executing external code."""
+    stack = [(root, 0)]
+    seen = set()
+    while stack:
+        value, depth = stack.pop()
+        if value is None or id(value) in seen or depth > max_depth:
+            continue
+        seen.add(id(value))
+        yield value
+        if isinstance(value, dict):
+            stack.extend((item, depth + 1) for item in value.values())
+            continue
+        if isinstance(value, (list, tuple, set)):
+            stack.extend((item, depth + 1) for item in value)
+            continue
+        if isinstance(value, functools.partial):
+            stack.append((value.func, depth + 1))
+            stack.extend((item, depth + 1) for item in value.args)
+            if value.keywords:
+                stack.extend((item, depth + 1) for item in value.keywords.values())
+        bound_self = getattr(value, "__self__", None)
+        bound_func = getattr(value, "__func__", None)
+        if bound_self is not None and bound_func is not None:
+            stack.append((bound_func, depth + 1))
+            stack.append((bound_self, depth + 1))
+        closure = getattr(value, "__closure__", None)
+        if closure:
+            for cell in closure:
+                try:
+                    stack.append((cell.cell_contents, depth + 1))
+                except ValueError:
+                    pass
+        defaults = getattr(value, "__defaults__", None)
+        if defaults:
+            stack.extend((item, depth + 1) for item in defaults)
+        kwdefaults = getattr(value, "__kwdefaults__", None)
+        if kwdefaults:
+            stack.extend((item, depth + 1) for item in kwdefaults.values())
+        attrs = getattr(value, "__dict__", None)
+        if isinstance(attrs, dict):
+            stack.extend((item, depth + 1) for item in attrs.values())
+        slots = getattr(type(value), "__slots__", ())
+        if isinstance(slots, str):
+            slots = (slots,)
+        for slot in slots:
+            if slot in ("__dict__", "__weakref__"):
+                continue
+            try:
+                stack.append((getattr(value, slot), depth + 1))
+            except (AttributeError, TypeError):
+                pass
+
+
+def _find_nested_mixer_wrapper(root, state):
+    sigma_fallback = None
+    for value in _iter_nested_objects(root):
+        if getattr(value, "_anima_mixer_state", None) is not state:
+            continue
+        if getattr(value, "_anima_adapter_mixer_wrapper", False):
+            return value
+        elif getattr(value, "_anima_adapter_anchor_sigma_wrapper", False):
+            sigma_fallback = value
+    return sigma_fallback
+
+
+def resolve_clone_local_mixer_wrapper(apply_model, current_wrapper, state):
+    """Dispatch a Mixer hidden by an external closure to clone-local state."""
+    patcher = active_patcher_for_apply_model(apply_model)
+    options = getattr(patcher, "model_options", None)
+    if not isinstance(options, dict):
+        return None
+    registry = options.get("_anima_mixer_clone_wrappers")
+    if not isinstance(registry, dict):
+        return None
+    rebound = registry.get(id(state))
+    if callable(rebound) and rebound is not current_wrapper:
+        return rebound
+    return None
 
 
 def _rebind_mixer_wrapper_chain(wrapper, old_state, new_state):
@@ -669,15 +902,55 @@ def _replace_mixer_lifecycle_callbacks(patcher, state, callback_key):
     add("on_cleanup", callback_key, _make_mixer_cleanup_callback(state))
 
 
+def _remove_mixer_lifecycle_callbacks(patcher, callback_key):
+    remove = getattr(patcher, "remove_callbacks_with_key", None)
+    if not callable(remove):
+        return
+    remove("on_clone", callback_key)
+    remove("on_pre_run", callback_key)
+    remove("on_cleanup", callback_key)
+
+
 def _make_mixer_clone_callback(state, callback_key):
     def _on_clone(_source, cloned):
+        if not adapter_mixer_state_is_active(state, patcher=cloned):
+            # A newer Adapter Mixer owns this branch.  Drop the dormant
+            # lifecycle callbacks while leaving sibling/source branches alone.
+            _remove_mixer_lifecycle_callbacks(cloned, callback_key)
+            return
         new_state = _clone_mixer_state_for_patcher(state, cloned)
         options = getattr(cloned, "model_options", None)
         if isinstance(options, dict):
+            clone_registry = options.get("_anima_mixer_clone_wrappers")
+            if isinstance(clone_registry, dict):
+                for origin_id, registered in tuple(clone_registry.items()):
+                    rebound_registered = _rebind_mixer_wrapper_chain(
+                        registered,
+                        state,
+                        new_state,
+                    )
+                    if rebound_registered is not registered:
+                        clone_registry[origin_id] = rebound_registered
             wrapper = options.get("model_function_wrapper")
             rebound = _rebind_mixer_wrapper_chain(wrapper, state, new_state)
             if rebound is not wrapper:
                 options["model_function_wrapper"] = rebound
+            else:
+                # External optimization nodes may wrap the Mixer in an opaque
+                # closure. The outer function itself cannot be reconstructed,
+                # so keep a clone-local rebound for the shared inner Mixer to
+                # dispatch to when this clone becomes active.
+                nested = _find_nested_mixer_wrapper(wrapper, state)
+                if nested is not None:
+                    nested_rebound = _rebind_mixer_wrapper_chain(
+                        nested,
+                        state,
+                        new_state,
+                    )
+                    options.setdefault(
+                        "_anima_mixer_clone_wrappers",
+                        {},
+                    )[id(state)] = nested_rebound
         _rebind_mixer_object_patches(cloned, state, new_state)
         _replace_mixer_lifecycle_callbacks(cloned, new_state, callback_key)
     return _on_clone
@@ -685,6 +958,11 @@ def _make_mixer_clone_callback(state, callback_key):
 
 def _make_mixer_pre_run_callback(state):
     def _on_pre_run(patcher):
+        active = adapter_mixer_state_is_active(state, patcher=patcher)
+        state["_adapter_mixer_selected_for_run"] = active
+        if not active:
+            clear_mixer_run_state(state)
+            return
         begin_mixer_execution(
             state,
             getattr(getattr(patcher, "model", None), "apply_model", None),
@@ -716,6 +994,8 @@ def _make_mixer_cleanup_callback(state):
             state.get("_run_call_count", 0)
         ) > 0
         clear_mixer_run_state(state)
+        if state.get("_adapter_mixer_instance_token") is not None:
+            state["_adapter_mixer_selected_for_run"] = False
         # This marker is historical boundary information, not live run state;
         # retain it so the next sigma fallback still recognizes a prior pass.
         state["_last_run_had_calls"] = had_calls

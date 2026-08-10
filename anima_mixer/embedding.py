@@ -10,12 +10,15 @@ from .constants import ALIGN_BASE_ANCHORED, ALIGN_SHARED_BASE_IDS
 from .math_utils import project_perpendicular
 from .parsing import normalize_weights
 from .patching import (
+    adapter_mixer_state_is_active,
     begin_mixer_execution,
     broadcast_batch,
     clear_mixer_run_state,
     execution_tensor_signature,
     diffusion_model_for_apply_model,
+    MixerFatalError,
     preprocess_one,
+    resolve_clone_local_mixer_wrapper,
     resolve_mask,
     resolve_strengths,
     resolve_multigpu_worker_wrapper,
@@ -204,6 +207,12 @@ def build_artist_embedding_sum(state, ref_context, dm=None):
         state["user_weights"],
         normalize=state.get("normalize_weights", True),
     ).detach()
+    # Dynamic-VRAM/quantized Adapter weights may run on auxiliary CUDA streams.
+    # Finish that one cached Adapter build before the main denoiser reuses or
+    # unloads the same weights.  This is once per cache miss, never per sigma.
+    if torch.cuda.is_available():
+        sync_device = ref_context.device if ref_context.device.type == "cuda" else None
+        torch.cuda.synchronize(sync_device)
     cache[cache_key] = artist_sum
     return artist_sum
 
@@ -245,7 +254,16 @@ def _cached_mixed_context(state, context, cache_key):
 
 def make_adapter_embedding_wrapper(state, prev_wrapper):
     """Replace post-adapter context at the model boundary, preserving wrapper chains."""
-    def wrapper(apply_model, options):
+    def _wrapper_body(apply_model, options):
+        if not adapter_mixer_state_is_active(state, apply_model=apply_model):
+            return _call_underlying(prev_wrapper, apply_model, options)
+        clone_wrapper = resolve_clone_local_mixer_wrapper(
+            apply_model,
+            wrapper,
+            state,
+        )
+        if clone_wrapper is not None:
+            return clone_wrapper(apply_model, options)
         raw_c = options.get("c") or {}
         transformer_options = raw_c.get("transformer_options") or {}
         is_multigpu = (
@@ -356,6 +374,11 @@ def make_adapter_embedding_wrapper(state, prev_wrapper):
                     mask,
                     fallback_base=fallback_base,
                 )
+                if not bool(torch.isfinite(mixed_context).all().item()):
+                    raise MixerFatalError(
+                        "[AnimaAdapterMixer] post-adapter mixed context contains "
+                        "non-finite values; aborting this sampling pass."
+                    )
                 if not is_multigpu:
                     state["_mixed_context_cache"] = {
                         "source": context,
@@ -382,6 +405,18 @@ def make_adapter_embedding_wrapper(state, prev_wrapper):
                 state["_warned_embedding_failure"] = True
             state["_embedding_mixer_failed"] = True
             return _call_underlying(prev_wrapper, apply_model, options)
+
+    def wrapper(apply_model, options):
+        # The sampler can raise InterruptProcessingException before the
+        # context branch, during clone-local/multi-GPU dispatch, or on the
+        # no-context fast path. Keep one abort-safe boundary around the whole
+        # wrapper so those paths release Mixer-owned state as well.
+        try:
+            return _wrapper_body(apply_model, options)
+        except BaseException as error:
+            if should_reraise(error):
+                clear_mixer_run_state(state, interrupted=True)
+            raise
 
     wrapper._anima_adapter_mixer_wrapper = True
     wrapper._anima_adapter_mixer_previous = prev_wrapper
