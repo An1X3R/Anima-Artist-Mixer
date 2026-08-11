@@ -367,6 +367,7 @@ class AnimaArtistAdapterMixer:
             "_warned_trajectory_invalidated": False,
             "_warned_trajectory_reuse": False,
             "_model_owner_token": None,
+            "_model_owner_ref": None,
             "_execution_index": 0,
             "_adapter_mixer_instance_token": secrets.token_hex(16),
             "_adapter_mixer_selected_for_run": None,

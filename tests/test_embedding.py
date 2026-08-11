@@ -36,6 +36,7 @@ from anima_mixer.patching import (
     _make_mixer_cleanup_callback,
     _rebind_mixer_object_patches,
     begin_mixer_execution,
+    call_with_mixer_owner,
     clear_mixer_run_state,
     reset_run_state,
 )
@@ -1886,6 +1887,180 @@ class MixerLifecycleRegressionTests(unittest.TestCase):
         wrapper(apply_model, options)
 
         self.assertEqual(state["_execution_index"], first_execution + 1)
+
+    def test_pre_run_owner_survives_shared_current_patcher_drift(self):
+        dm = FakeAdapterModel()
+        model = FakeModelPatcher(dm)
+        patched, _ = AnimaArtistAdapterMixer().patch(
+            model,
+            self._artist_pack(),
+            strength=1.0,
+            normalize_weights=True,
+            alignment_mode=ALIGN_BASE_ANCHORED,
+            enabled=True,
+            apply_to_uncond=False,
+            uncond_strength=0.0,
+        )
+        wrapper = patched.model_options["model_function_wrapper"]
+        state = wrapper._anima_adapter_mixer_state
+
+        class SharedModel:
+            def __init__(self):
+                self.current_patcher = patched
+
+            def apply_model(self, _input, _timestep, **kwargs):
+                return kwargs["c_crossattn"]
+
+        shared_model = SharedModel()
+        options = {
+            "input": torch.zeros((1, 1)),
+            "timestep": torch.ones((1,)),
+            "c": {
+                "c_crossattn": torch.ones((1, 2, 2)),
+                "transformer_options": {"cond_or_uncond": [0]},
+            },
+            "cond_or_uncond": [0],
+        }
+
+        patched.pre_run()
+        expected_owner = ("patcher", id(patched))
+        self.assertEqual(state["_model_owner_token"], expected_owner)
+
+        # Several ModelPatchers can share one BaseModel.  A later pre_run on a
+        # sibling clone overwrites BaseModel.current_patcher even though this
+        # wrapper/options pair still belongs to the original sampling pass.
+        sibling = FakeModelPatcher(dm)
+        sibling.model_options = dict(patched.model_options)
+        shared_model.current_patcher = sibling
+        wrapper(shared_model.apply_model, options)
+
+        self.assertEqual(state["_model_owner_token"], expected_owner)
+
+    def test_shared_current_patcher_drift_does_not_route_adapter_or_forward_to_sibling(self):
+        main_dm = FakeAdapterModel()
+        sibling_dm = FakeAdapterModel()
+        state = make_state(main_dm)
+        state.update({
+            "_adapter_mixer_instance_token": "main-mixer",
+            "_adapter_mixer_selected_for_run": True,
+            "_run_active": True,
+        })
+
+        class Owner:
+            def __init__(self, diffusion_model):
+                self.diffusion_model = diffusion_model
+                self.model = None
+
+            def get_model_object(self, name):
+                if name != "diffusion_model":
+                    raise KeyError(name)
+                return self.diffusion_model
+
+        main_owner = Owner(main_dm)
+        sibling_owner = Owner(sibling_dm)
+
+        class SharedModel:
+            def __init__(self):
+                self.current_patcher = sibling_owner
+                self.seen_patchers = []
+
+            def apply_model(self, _input, _timestep, **kwargs):
+                self.seen_patchers.append(self.current_patcher)
+                return kwargs["c_crossattn"]
+
+        shared_model = SharedModel()
+        main_owner.model = shared_model
+        sibling_owner.model = shared_model
+        state["_model_owner_token"] = ("patcher", id(main_owner))
+        state["_model_owner_ref"] = main_owner
+        wrapper = make_adapter_embedding_wrapper(state, None)
+        context = torch.ones((1, 3, 2))
+
+        output = wrapper(shared_model.apply_model, {
+            "input": torch.zeros((1, 1)),
+            "timestep": torch.ones((1,)),
+            "c": {
+                "c_crossattn": context,
+                "transformer_options": {"cond_or_uncond": [0]},
+            },
+            "cond_or_uncond": [0],
+        })
+
+        self.assertEqual(len(main_dm.seen_ids), 2)
+        self.assertEqual(len(sibling_dm.seen_ids), 0)
+        self.assertEqual(shared_model.seen_patchers, [main_owner])
+        self.assertIs(shared_model.current_patcher, sibling_owner)
+        self.assertEqual(tuple(output.shape), (1, 5, 2))
+
+    def test_owner_scope_restores_pointer_after_interrupt(self):
+        state = {}
+
+        class Owner:
+            def __init__(self):
+                self.model = None
+
+        class SharedModel:
+            def __init__(self):
+                self.current_patcher = None
+
+            def apply_model(self, *_args, **_kwargs):
+                raise AssertionError("callback should not be used in this test")
+
+        owner = Owner()
+        sibling = Owner()
+        shared_model = SharedModel()
+        owner.model = shared_model
+        sibling.model = shared_model
+        shared_model.current_patcher = sibling
+        state["_model_owner_ref"] = owner
+
+        class Interrupt(BaseException):
+            pass
+
+        def abort():
+            raise Interrupt("stop")
+
+        with self.assertRaises(Interrupt):
+            call_with_mixer_owner(
+                state,
+                shared_model.apply_model,
+                abort,
+            )
+
+        self.assertIs(shared_model.current_patcher, sibling)
+
+    def test_inactive_parent_clone_is_not_reactivated_by_shared_patcher(self):
+        dm = FakeAdapterModel()
+        state = make_state(dm)
+        state["_adapter_mixer_instance_token"] = "same-mixer"
+        state["_adapter_mixer_selected_for_run"] = False
+        wrapper = make_adapter_embedding_wrapper(state, None)
+
+        class Patcher:
+            model_options = {
+                "_anima_adapter_mixer_active_token": "same-mixer",
+            }
+
+        class SharedModel:
+            current_patcher = Patcher()
+
+            def apply_model(self, _input, _timestep, **kwargs):
+                return kwargs["c_crossattn"]
+
+        shared_model = SharedModel()
+        context = torch.ones((1, 3, 2))
+        output = wrapper(shared_model.apply_model, {
+            "input": torch.zeros((1, 1)),
+            "timestep": torch.ones((1,)),
+            "c": {
+                "c_crossattn": context,
+                "transformer_options": {"cond_or_uncond": [0]},
+            },
+            "cond_or_uncond": [0],
+        })
+
+        self.assertIs(output, context)
+        self.assertEqual(dm.seen_ids, [])
 
     def test_cross_attention_sigma_fallback_binds_timestep_before_begin(self):
         state = make_state(FakeAdapterModel())

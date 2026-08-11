@@ -13,9 +13,9 @@ from .patching import (
     adapter_mixer_state_is_active,
     begin_mixer_execution,
     broadcast_batch,
+    call_with_mixer_owner,
     clear_mixer_run_state,
     execution_tensor_signature,
-    diffusion_model_for_apply_model,
     MixerFatalError,
     preprocess_one,
     resolve_clone_local_mixer_wrapper,
@@ -217,14 +217,19 @@ def build_artist_embedding_sum(state, ref_context, dm=None):
     return artist_sum
 
 
-def _call_underlying(prev_wrapper, apply_model, options):
-    if prev_wrapper is not None:
-        return prev_wrapper(apply_model, options)
-    return apply_model(
-        options["input"],
-        options["timestep"],
-        **options["c"],
-    )
+def _call_underlying(prev_wrapper, apply_model, options, state=None):
+    def _call():
+        if prev_wrapper is not None:
+            return prev_wrapper(apply_model, options)
+        return apply_model(
+            options["input"],
+            options["timestep"],
+            **options["c"],
+        )
+
+    if state is None:
+        return _call()
+    return call_with_mixer_owner(state, apply_model, _call)
 
 
 def _mixed_context_cache_key(state, context, mask, strengths):
@@ -255,8 +260,6 @@ def _cached_mixed_context(state, context, cache_key):
 def make_adapter_embedding_wrapper(state, prev_wrapper):
     """Replace post-adapter context at the model boundary, preserving wrapper chains."""
     def _wrapper_body(apply_model, options):
-        if not adapter_mixer_state_is_active(state, apply_model=apply_model):
-            return _call_underlying(prev_wrapper, apply_model, options)
         clone_wrapper = resolve_clone_local_mixer_wrapper(
             apply_model,
             wrapper,
@@ -264,6 +267,8 @@ def make_adapter_embedding_wrapper(state, prev_wrapper):
         )
         if clone_wrapper is not None:
             return clone_wrapper(apply_model, options)
+        if not adapter_mixer_state_is_active(state, apply_model=apply_model):
+            return _call_underlying(prev_wrapper, apply_model, options, state)
         raw_c = options.get("c") or {}
         transformer_options = raw_c.get("transformer_options") or {}
         is_multigpu = (
@@ -302,7 +307,7 @@ def make_adapter_embedding_wrapper(state, prev_wrapper):
         # this call, preventing the sigma wrapper from running it a second time.
         state["_adapter_mixer_run_start"] = bool(is_run_start)
         if state.get("_embedding_mixer_failed", False):
-            return _call_underlying(prev_wrapper, apply_model, options)
+            return _call_underlying(prev_wrapper, apply_model, options, state)
 
         c = raw_c
         context_key = None
@@ -317,7 +322,7 @@ def make_adapter_embedding_wrapper(state, prev_wrapper):
                     "the original model context is used."
                 )
                 state["_warned_no_context"] = True
-            return _call_underlying(prev_wrapper, apply_model, options)
+            return _call_underlying(prev_wrapper, apply_model, options, state)
 
         try:
             context = c[context_key]
@@ -347,11 +352,15 @@ def make_adapter_embedding_wrapper(state, prev_wrapper):
                 else _cached_mixed_context(state, context, cache_key)
             )
             if mixed_context is None:
-                active_dm = diffusion_model_for_apply_model(
+                # ``begin_mixer_execution`` pins ``dm_ref`` to the selected
+                # clone. Resolving through BaseModel.current_patcher here would
+                # reintroduce the sibling-clone drift the lifecycle repair
+                # explicitly filters out.
+                active_dm = state.get("dm_ref")
+                artist_sum = call_with_mixer_owner(
+                    state,
                     apply_model,
-                    state.get("dm_ref"),
-                )
-                artist_sum = build_artist_embedding_sum(
+                    build_artist_embedding_sum,
                     state,
                     context,
                     dm=active_dm,
@@ -391,7 +400,7 @@ def make_adapter_embedding_wrapper(state, prev_wrapper):
             mixed_c[context_key] = mixed_context
             mixed_options = dict(options)
             mixed_options["c"] = mixed_c
-            return _call_underlying(prev_wrapper, apply_model, mixed_options)
+            return _call_underlying(prev_wrapper, apply_model, mixed_options, state)
         except BaseException as error:
             if should_reraise(error):
                 clear_mixer_run_state(state, interrupted=True)
@@ -404,7 +413,7 @@ def make_adapter_embedding_wrapper(state, prev_wrapper):
                 )
                 state["_warned_embedding_failure"] = True
             state["_embedding_mixer_failed"] = True
-            return _call_underlying(prev_wrapper, apply_model, options)
+            return _call_underlying(prev_wrapper, apply_model, options, state)
 
     def wrapper(apply_model, options):
         # The sampler can raise InterruptProcessingException before the

@@ -247,6 +247,7 @@ def reset_run_state(state):
     state["_multigpu_call"] = False
     state["_multigpu_dm_by_worker"] = {}
     state["_interrupt_cleanup_complete"] = False
+    state["_warned_owner_drift"] = False
 
 
 def _sigma_value(timestep):
@@ -356,11 +357,17 @@ def clear_mixer_run_state(state, *, interrupted=False):
     state["_adapter_mixer_run_start"] = None
     state["_adapter_mixer_finalize_warm_cache"] = False
     state["current_sigma"] = None
+    state["_model_owner_ref"] = None
 
     if interrupted:
         state["_abort_input_signature"] = previous_input_signature
         state["_force_boundary_check"] = True
         state["_interrupt_cleanup_complete"] = True
+        if state.get("_adapter_mixer_instance_token") is not None:
+            # The normal ModelPatcher cleanup callback also closes lifecycle
+            # selection. An outer interrupt can unwind before that callback,
+            # so make the stale wrapper a pass-through immediately.
+            state["_adapter_mixer_selected_for_run"] = False
         # Aimdo/VBAR can have outstanding work on an offload stream when a
         # prompt is interrupted.  Synchronize only on this exceptional path;
         # normal per-step sampling remains asynchronous.
@@ -412,6 +419,15 @@ def adapter_mixer_state_is_active(state, apply_model=None, patcher=None):
     token = state.get("_adapter_mixer_instance_token")
     if token is None:
         return True
+    # ``on_pre_run`` is authoritative for the wrapper/options pair selected by
+    # ComfyUI. ``BaseModel.current_patcher`` is shared by sibling clones and can
+    # be overwritten between pre_run and the first model call when another
+    # sampler/detailer prepares its clone. Once lifecycle selection happened,
+    # do not let that shared pointer flip this state mid-run.
+    if patcher is None:
+        selected = state.get("_adapter_mixer_selected_for_run")
+        if selected is not None:
+            return bool(selected)
     if patcher is None and apply_model is not None:
         patcher = active_patcher_for_apply_model(apply_model)
     options = getattr(patcher, "model_options", None)
@@ -491,6 +507,34 @@ def diffusion_model_for_apply_model(apply_model, fallback=None):
         active_patcher_for_apply_model(apply_model),
         fallback,
     )
+
+
+def call_with_mixer_owner(state, apply_model, callback, *args, **kwargs):
+    """Run one model/Adapter call with the clone-local patcher selected at pre_run.
+
+    ``BaseModel.current_patcher`` is a single mutable pointer shared by all
+    ``ModelPatcher`` clones that share one ``BaseModel``.  A later detailer or
+    sampler can overwrite it before an older wrapper reaches the model.  The
+    Mixer already pins its cache owner; this companion guard makes the actual
+    dynamic-VRAM/LoRA forward observe the same patcher for the duration of the
+    call, then restores the pointer so sibling branches keep their own state.
+    """
+    owner = state.get("_model_owner_ref")
+    model = getattr(apply_model, "__self__", None)
+    if owner is None or model is None or getattr(owner, "model", None) is not model:
+        return callback(*args, **kwargs)
+
+    previous = getattr(model, "current_patcher", None)
+    changed = previous is not owner
+    if changed:
+        model.current_patcher = owner
+    try:
+        return callback(*args, **kwargs)
+    finally:
+        # If another explicitly nested branch changed the pointer while this
+        # call was running, do not overwrite that branch's newer selection.
+        if changed and getattr(model, "current_patcher", None) is owner:
+            model.current_patcher = previous
 
 
 def resolve_multigpu_worker_wrapper(apply_model, options, current_wrapper):
@@ -582,19 +626,52 @@ def begin_mixer_execution(
     a previous warm-cache trajectory at the correct point in the call chain.
     """
     sigma = _sigma_value(timestep)
-    active_patcher = owner
-    if active_patcher is None:
-        model = getattr(apply_model, "__self__", None)
-        active_patcher = getattr(model, "current_patcher", None)
-    owner_token = (
-        owner_token_override
-        if owner_token_override is not None
-        else _model_owner_token(apply_model, owner=active_patcher)
+    # Once on_pre_run has bound this state to a ModelPatcher, retain that
+    # owner/weight identity for the whole pass. The underlying BaseModel is
+    # shared by clones, so its live ``current_patcher`` field can point at a
+    # sibling second-stage/detailer clone even while this wrapper is executing.
+    use_pre_run_owner = bool(
+        not explicit_run_start
+        and owner is None
+        and owner_token_override is None
+        and state.get("_adapter_mixer_selected_for_run") is True
+        and state.get("_run_active", False)
+        and state.get("_model_owner_token") is not None
     )
+    if use_pre_run_owner:
+        active_patcher = None
+        owner_token = state.get("_model_owner_token")
+        shared_owner_token = True
+        weight_identity = state.get("_model_weight_patch_identity")
+        live_model = getattr(apply_model, "__self__", None)
+        live_patcher = getattr(live_model, "current_patcher", None)
+        live_owner_token = _model_owner_token(apply_model, owner=live_patcher)
+        if (
+            live_owner_token not in (None, owner_token)
+            and not state.get("_warned_owner_drift", False)
+        ):
+            logger.info(
+                "[AnimaAdapterMixer] ignored shared current_patcher drift "
+                "during the active run (bound=%s, live=%s, state=%x).",
+                owner_token,
+                live_owner_token,
+                id(state),
+            )
+            state["_warned_owner_drift"] = True
+    else:
+        active_patcher = owner
+        if active_patcher is None:
+            model = getattr(apply_model, "__self__", None)
+            active_patcher = getattr(model, "current_patcher", None)
+        owner_token = (
+            owner_token_override
+            if owner_token_override is not None
+            else _model_owner_token(apply_model, owner=active_patcher)
+        )
+        shared_owner_token = owner_token_override is not None
+        weight_identity = model_weight_patch_identity(active_patcher)
     previous_owner = state.get("_model_owner_token")
     owner_changed = owner_token is not None and previous_owner not in (None, owner_token)
-    shared_owner_token = owner_token_override is not None
-    weight_identity = model_weight_patch_identity(active_patcher)
     previous_weight_identity = state.get("_model_weight_patch_identity")
     weight_changed = (
         weight_identity is not None
@@ -627,6 +704,8 @@ def begin_mixer_execution(
         )
     if previous_owner is None and owner_token is not None:
         state["_model_owner_token"] = owner_token
+        if active_patcher is not None:
+            state["_model_owner_ref"] = active_patcher
         if not shared_owner_token:
             state["dm_ref"] = _diffusion_model_for_patcher(
                 active_patcher,
@@ -635,6 +714,8 @@ def begin_mixer_execution(
     elif owner_changed:
         _clear_model_bound_mixer_state(state)
         state["_model_owner_token"] = owner_token
+        if active_patcher is not None:
+            state["_model_owner_ref"] = active_patcher
         if not shared_owner_token:
             state["dm_ref"] = _diffusion_model_for_patcher(
                 active_patcher,
@@ -658,6 +739,10 @@ def begin_mixer_execution(
             _format_weight_patch_identity(previous_weight_identity),
             _format_weight_patch_identity(weight_identity),
         )
+    elif active_patcher is not None and state.get("_model_owner_ref") is None:
+        # A direct sigma-wrapper fallback may enter without the lifecycle
+        # callback having initialized the owner reference yet.
+        state["_model_owner_ref"] = active_patcher
     if conditioning_changed:
         _clear_model_bound_mixer_state(state)
         if str(state.get("alignment_mode", "")) == "base_anchored":
@@ -747,6 +832,7 @@ def _clone_mixer_state_for_patcher(state, patcher):
     _clear_model_bound_mixer_state(cloned)
     reset_run_state(cloned)
     cloned["_model_owner_token"] = None
+    cloned["_model_owner_ref"] = None
     cloned["_model_weight_patch_identity"] = None
     cloned["_run_last_sigma"] = None
     cloned["_run_active"] = False
@@ -830,10 +916,20 @@ def _find_nested_mixer_wrapper(root, state):
 
 def resolve_clone_local_mixer_wrapper(apply_model, current_wrapper, state):
     """Dispatch a Mixer hidden by an external closure to clone-local state."""
+    # A state selected by its own pre_run callback already is the clone-local
+    # target. Looking at shared BaseModel.current_patcher here could redirect it
+    # into a sibling sampler's state.
+    if state.get("_adapter_mixer_selected_for_run") is True:
+        return None
     patcher = active_patcher_for_apply_model(apply_model)
     options = getattr(patcher, "model_options", None)
     if not isinstance(options, dict):
         return None
+    token = state.get("_adapter_mixer_instance_token")
+    if token is not None:
+        active_token = options.get(_ACTIVE_ADAPTER_MIXER_TOKEN_KEY)
+        if active_token not in (None, token):
+            return None
     registry = options.get("_anima_mixer_clone_wrappers")
     if not isinstance(registry, dict):
         return None

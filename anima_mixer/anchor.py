@@ -19,6 +19,7 @@ from .constants import (
 from .patching import (
     adapter_mixer_state_is_active,
     begin_mixer_execution,
+    call_with_mixer_owner,
     clear_mixer_run_state,
     context_fingerprint,
     diffusion_model_for_apply_model,
@@ -516,6 +517,13 @@ def _run_or_load_warm_anchor(state, user_x, user_timestep, c_dict, apply_model, 
 
 def make_sigma_capture(state, prev_wrapper):
     def _wrapper_body(apply_model, options):
+        clone_wrapper = resolve_clone_local_mixer_wrapper(
+            apply_model,
+            wrapper,
+            state,
+        )
+        if clone_wrapper is not None:
+            return clone_wrapper(apply_model, options)
         if not adapter_mixer_state_is_active(state, apply_model=apply_model):
             if prev_wrapper is not None:
                 return prev_wrapper(apply_model, options)
@@ -524,13 +532,6 @@ def make_sigma_capture(state, prev_wrapper):
                 options["timestep"],
                 **options["c"],
             )
-        clone_wrapper = resolve_clone_local_mixer_wrapper(
-            apply_model,
-            wrapper,
-            state,
-        )
-        if clone_wrapper is not None:
-            return clone_wrapper(apply_model, options)
         ts = options.get("timestep")
         user_ts = ts
         c_dict = options.get("c", {}) or {}
@@ -643,7 +644,10 @@ def make_sigma_capture(state, prev_wrapper):
             user_x = options.get("input")
             if user_x is not None and user_ts is not None and c_dict:
                 if refresh_mode == ANCHOR_REFRESH_WARM_CACHE and cur_sigma is not None:
-                    _run_or_load_warm_anchor(
+                    call_with_mixer_owner(
+                        state,
+                        apply_model,
+                        _run_or_load_warm_anchor,
                         state,
                         user_x,
                         user_ts,
@@ -652,12 +656,24 @@ def make_sigma_capture(state, prev_wrapper):
                         cur_sigma,
                     )
                 elif is_anchor_start or not state.get("_anchor_cache"):
-                    maybe_run_anchor(state, user_x, user_ts, c_dict, apply_model=apply_model)
+                    call_with_mixer_owner(
+                        state,
+                        apply_model,
+                        maybe_run_anchor,
+                        state,
+                        user_x,
+                        user_ts,
+                        c_dict,
+                        apply_model,
+                    )
 
         try:
-            if prev_wrapper is not None:
-                return prev_wrapper(apply_model, options)
-            return apply_model(options["input"], options["timestep"], **options["c"])
+            def _call_previous():
+                if prev_wrapper is not None:
+                    return prev_wrapper(apply_model, options)
+                return apply_model(options["input"], options["timestep"], **options["c"])
+
+            return call_with_mixer_owner(state, apply_model, _call_previous)
         except BaseException as error:
             if should_reraise(error):
                 clear_mixer_run_state(state, interrupted=True)

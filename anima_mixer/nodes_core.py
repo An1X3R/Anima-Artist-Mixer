@@ -465,6 +465,8 @@ class AnimaArtistCrossAttn:
             "_anchor_last_sigma": None,
             "_in_anchor_run": False,
             "_anchor_failed": False,
+            "_model_owner_token": None,
+            "_model_owner_ref": None,
         }
 
         prev = m.model_options.get("model_function_wrapper")
