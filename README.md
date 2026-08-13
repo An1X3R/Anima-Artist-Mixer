@@ -64,6 +64,20 @@ ComfyUI/custom_nodes/Anima-Artist-Mixer/
 
 Restart ComfyUI. No extra Python dependencies are required.
 
+### Anima-2.9B compatibility
+
+Anima-2.9B expands the original Anima DiT from 28 blocks to 40 blocks while
+keeping the same `blocks[i].cross_attn` and LLM Adapter interfaces. On import,
+this plugin installs a small ComfyUI loader hook that reads the serialized
+`blocks.<index>` keys and sets `num_blocks` to the checkpoint's actual count
+before the diffusion model is constructed. This allows the mixer to work with
+both the original Anima checkpoints and the 2.9B expanded checkpoint without
+requiring a second loader-patch custom node.
+
+If `ComfyUI-Anima-2.9B` is also installed, its equivalent loader hook is safe to
+keep enabled; the hooks are idempotent and both use the checkpoint's real block
+count.
+
 ## Requirements
 
 - Anima model only.
