@@ -16,6 +16,11 @@ from .constants import (
     STATIC_CAPTURE_K_DEFAULT,
     STATIC_CAPTURE_K_MAX,
 )
+from .model_compat import (
+    ANIMA_29B_BLOCK_MODE_AUTO,
+    ANIMA_29B_BLOCK_MODE_LEGACY_28,
+    resolve_anima_block_layout,
+)
 from .parsing import (
     expand_prompt_weights,
     parse_anchor_seed_list,
@@ -213,6 +218,9 @@ class AnimaArtistCrossAttn:
         stabilizer_end_percent = max(
             0.0, min(1.0, float(adv.get("stabilizer_end_percent", 1.0)))
         )
+        anima_29b_block_mode = str(
+            adv.get("anima_29b_block_mode", ANIMA_29B_BLOCK_MODE_AUTO)
+        )
         layer_filter_text = str(adv.get("layer_filter", "") or "")
         uncond_strength = max(0.0, min(1.0, float(uncond_strength)))
 
@@ -360,23 +368,52 @@ class AnimaArtistCrossAttn:
                 "(missing preprocess_text_embeds)"
             )
 
-        explicit_blocks = parse_layer_filter(layer_filter_text, num_blocks)
+        block_layout = resolve_anima_block_layout(
+            num_blocks,
+            anima_29b_block_mode,
+        )
+        selector_block_count = block_layout.selector_block_count
+        explicit_blocks = parse_layer_filter(
+            layer_filter_text,
+            selector_block_count,
+        )
         if explicit_blocks is not None:
             if not explicit_blocks:
                 raise ValueError(
                     f"[AnimaCrossAttn] layer_filter {layer_filter_text!r} "
-                    f"matches no blocks (model has {num_blocks} blocks)"
+                    "matches no selectable blocks "
+                    f"(mode={block_layout.resolved_mode}, "
+                    f"selectable={selector_block_count}, physical={num_blocks})"
                 )
-            target_blocks = explicit_blocks
+            selector_blocks = explicit_blocks
         else:
             sb_real = max(0, sb)
-            eb_real = num_blocks - 1 if eb < 0 else min(num_blocks - 1, eb)
+            eb_real = (
+                selector_block_count - 1
+                if eb < 0
+                else min(selector_block_count - 1, eb)
+            )
             if sb_real > eb_real:
                 raise ValueError(
                     f"[AnimaCrossAttn] start_block={sb_real} > end_block={eb_real} "
-                    f"(model has {num_blocks} blocks)"
+                    f"(mode={block_layout.resolved_mode}, "
+                    f"selectable={selector_block_count}, physical={num_blocks})"
                 )
-            target_blocks = list(range(sb_real, eb_real + 1))
+            selector_blocks = list(range(sb_real, eb_real + 1))
+
+        target_blocks = block_layout.map_selector_blocks(selector_blocks)
+        if block_layout.resolved_mode == ANIMA_29B_BLOCK_MODE_LEGACY_28:
+            logger.info(
+                "[AnimaCrossAttn] Anima-2.9B block mode=%s: selected %d/%d "
+                "legacy blocks -> %d/%d physical blocks; inserted blocks "
+                "remain untouched: %s",
+                block_layout.resolved_mode,
+                len(selector_blocks),
+                selector_block_count,
+                len(target_blocks),
+                num_blocks,
+                ",".join(str(i) for i in block_layout.skipped_physical_blocks),
+            )
 
         use_sigma_range = (start_percent > 0.0) or (end_percent < 1.0)
         use_stabilizer_window = stabilizer_end_percent < 1.0
@@ -439,6 +476,8 @@ class AnimaArtistCrossAttn:
             "anchor_seeds_count": anchor_seeds_count,
             "anchor_user_blend": anchor_user_blend,
             "anchor_deep_layer_threshold": anchor_deep_layer_threshold,
+            "anchor_layer_ordinals": block_layout.logical_index_by_physical,
+            "anima_29b_block_mode": block_layout.resolved_mode,
             "individuals": None,
             "real_lens": None,
             "dm_ref": dm,

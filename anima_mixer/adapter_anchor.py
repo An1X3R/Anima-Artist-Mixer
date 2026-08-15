@@ -55,7 +55,11 @@ def resolve_adapter_anchor_input(x, state, layer_index, transformer_options):
         "anchor_deep_layer_threshold",
         ANCHOR_LAYER_THRESHOLD_DISABLED,
     ))
-    if threshold >= 0 and layer_index >= threshold:
+    layer_ordinal = state.get("anchor_layer_ordinals", {}).get(
+        layer_index,
+        layer_index,
+    )
+    if threshold >= 0 and layer_ordinal >= threshold:
         return x
 
     anchor_x = state.get("_anchor_cache", {}).get(layer_index)

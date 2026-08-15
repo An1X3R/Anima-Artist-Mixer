@@ -17,6 +17,10 @@ from .constants import (
     STATIC_CAPTURE_K_DEFAULT,
     STATIC_CAPTURE_K_MAX,
 )
+from .model_compat import (
+    ANIMA_29B_BLOCK_MODE_AUTO,
+    ANIMA_29B_BLOCK_MODES,
+)
 from .parsing import parse_anchor_seed_list
 
 
@@ -132,6 +136,15 @@ class AnimaArtistOptions:
                         "error; first warmup uses more CPU transfer."
                     ),
                 }),
+                "anima_29b_block_mode": (list(ANIMA_29B_BLOCK_MODES), {
+                    "default": ANIMA_29B_BLOCK_MODE_AUTO,
+                    "tooltip": (
+                        "Anima-2.9B only. auto/legacy_28 use the original 28 "
+                        "2B-aligned positions and leave 12 inserted blocks "
+                        "untouched. native_40 explicitly addresses all 40 blocks. "
+                        "Other Anima models are unchanged."
+                    ),
+                }),
             },
         }
 
@@ -144,7 +157,8 @@ class AnimaArtistOptions:
     def IS_CHANGED(cls, anchor_seed_list="", artist_anchor_q=False,
                    anchor_refresh_mode=ANCHOR_REFRESH_ONCE,
                    anchor_cache_points=ANCHOR_CACHE_POINTS_DEFAULT,
-                   anchor_keyframe_mode=ANCHOR_KEYFRAME_UNIFORM_SIGMA, **kwargs):
+                   anchor_keyframe_mode=ANCHOR_KEYFRAME_UNIFORM_SIGMA,
+                   anima_29b_block_mode=ANIMA_29B_BLOCK_MODE_AUTO, **kwargs):
         if artist_anchor_q and not parse_anchor_seed_list(
             anchor_seed_list, ANCHOR_SEEDS_MAX
         ):
@@ -155,6 +169,7 @@ class AnimaArtistOptions:
             str(int(anchor_cache_points)),
             str(anchor_keyframe_mode),
             str(bool(artist_anchor_q)),
+            str(anima_29b_block_mode),
         ))
 
     def build(self, start_block, end_block, start_percent, end_percent, normalize_weights,
@@ -166,7 +181,8 @@ class AnimaArtistOptions:
               anchor_refresh_mode=ANCHOR_REFRESH_ONCE,
               anchor_cache_points=ANCHOR_CACHE_POINTS_DEFAULT,
               layer_filter="",
-              anchor_keyframe_mode=ANCHOR_KEYFRAME_UNIFORM_SIGMA):
+              anchor_keyframe_mode=ANCHOR_KEYFRAME_UNIFORM_SIGMA,
+              anima_29b_block_mode=ANIMA_29B_BLOCK_MODE_AUTO):
         manual_seeds = parse_anchor_seed_list(anchor_seed_list, ANCHOR_SEEDS_MAX)
         if manual_seeds:
             seeds_used = manual_seeds
@@ -210,6 +226,11 @@ class AnimaArtistOptions:
                 else ANCHOR_KEYFRAME_UNIFORM_SIGMA
             ),
             "layer_filter": str(layer_filter or ""),
+            "anima_29b_block_mode": (
+                str(anima_29b_block_mode)
+                if str(anima_29b_block_mode) in ANIMA_29B_BLOCK_MODES
+                else ANIMA_29B_BLOCK_MODE_AUTO
+            ),
         }, resolved_seed_list)
 
 

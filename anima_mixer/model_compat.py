@@ -7,6 +7,7 @@ before the diffusion model is instantiated; the runtime mixer cannot repair a
 model that failed to load.
 """
 
+from dataclasses import dataclass
 from functools import wraps
 import logging
 
@@ -14,6 +15,105 @@ import logging
 logger = logging.getLogger(__name__)
 
 _PATCH_MARKER = "_anima_artist_mixer_dynamic_block_patch"
+
+ANIMA_2B_BLOCK_COUNT = 28
+ANIMA_29B_BLOCK_COUNT = 40
+ANIMA_29B_BLOCK_MODE_AUTO = "auto"
+ANIMA_29B_BLOCK_MODE_LEGACY_28 = "legacy_28"
+ANIMA_29B_BLOCK_MODE_NATIVE_40 = "native_40"
+ANIMA_29B_BLOCK_MODES = (
+    ANIMA_29B_BLOCK_MODE_AUTO,
+    ANIMA_29B_BLOCK_MODE_LEGACY_28,
+    ANIMA_29B_BLOCK_MODE_NATIVE_40,
+)
+
+# Anima-2.9B retains the original 28 Anima-2B blocks and inserts 12 new
+# blocks between them. Auto mode uses the original 2B-aligned positions so the
+# runtime mixer keeps the same injection density on the expanded checkpoint.
+# Native mode remains available as an explicit opt-in for all 40 blocks.
+ANIMA_2B_TO_29B_BLOCKS = (
+    0, 1, 3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 18, 19,
+    20, 22, 23, 25, 26, 28, 29, 31, 32, 34, 35, 37, 38, 39,
+)
+ANIMA_29B_INSERTED_BLOCKS = (
+    2, 5, 8, 11, 14, 17, 21, 24, 27, 30, 33, 36,
+)
+
+
+@dataclass(frozen=True)
+class AnimaBlockLayout:
+    """Logical selector space and physical block indices for one model."""
+
+    model_block_count: int
+    requested_mode: str
+    resolved_mode: str
+    physical_blocks: tuple
+
+    @property
+    def selector_block_count(self):
+        return len(self.physical_blocks)
+
+    @property
+    def logical_index_by_physical(self):
+        return {
+            physical_index: logical_index
+            for logical_index, physical_index in enumerate(self.physical_blocks)
+        }
+
+    @property
+    def skipped_physical_blocks(self):
+        selected = set(self.physical_blocks)
+        return tuple(
+            index for index in range(self.model_block_count)
+            if index not in selected
+        )
+
+    def map_selector_blocks(self, selector_blocks):
+        mapped = []
+        for selector_index in selector_blocks:
+            index = int(selector_index)
+            if 0 <= index < self.selector_block_count:
+                mapped.append(self.physical_blocks[index])
+        return tuple(mapped)
+
+
+def resolve_anima_block_layout(num_blocks, mode=ANIMA_29B_BLOCK_MODE_AUTO):
+    """Resolve the user-facing block selector to physical model blocks.
+
+    On a 40-block Anima-2.9B model, ``auto`` resolves to ``legacy_28`` and maps
+    selectors to the original 2B block positions. ``native_40`` is an opt-in
+    mode that exposes every physical block. Other Anima block counts remain
+    identity-mapped.
+    """
+
+    block_count = max(0, int(num_blocks))
+    requested_mode = str(mode or ANIMA_29B_BLOCK_MODE_AUTO)
+    if requested_mode not in ANIMA_29B_BLOCK_MODES:
+        requested_mode = ANIMA_29B_BLOCK_MODE_AUTO
+
+    if block_count != ANIMA_29B_BLOCK_COUNT:
+        return AnimaBlockLayout(
+            model_block_count=block_count,
+            requested_mode=requested_mode,
+            resolved_mode="native",
+            physical_blocks=tuple(range(block_count)),
+        )
+
+    resolved_mode = requested_mode
+    if requested_mode == ANIMA_29B_BLOCK_MODE_AUTO:
+        resolved_mode = ANIMA_29B_BLOCK_MODE_LEGACY_28
+
+    physical_blocks = (
+        tuple(range(block_count))
+        if resolved_mode == ANIMA_29B_BLOCK_MODE_NATIVE_40
+        else ANIMA_2B_TO_29B_BLOCKS
+    )
+    return AnimaBlockLayout(
+        model_block_count=block_count,
+        requested_mode=requested_mode,
+        resolved_mode=resolved_mode,
+        physical_blocks=physical_blocks,
+    )
 
 
 def _scan_block_count(state_dict, key_prefix=""):

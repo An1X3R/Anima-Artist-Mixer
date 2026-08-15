@@ -93,6 +93,7 @@ Provides advanced settings for users
 	anchor_refresh_mode          [Adapter Mixer only] once=single snapshot, warm_cache=session reuse
 	anchor_cache_points          [Adapter Mixer only] warm_cache CPU keyframes, default 8, range 2~12
 	anchor_keyframe_mode         [Adapter Mixer only] uniform_sigma or bounded adaptive_q selection
+	anima_29b_block_mode         auto/legacy_28 patches the 28 aligned 2.9B blocks; native_40 explicitly patches all 40 physical blocks
 4. Stability tools are usually enabled progressively from light to heavy: try ema first → if not enough, switch to lowrank_avg → still not enough, enable static_capture → still not enough, enable anchor_q
 5. Layer range can shorten generation time, but with some quality impact, advanced users can tune it themselves
 

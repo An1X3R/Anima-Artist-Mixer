@@ -26,6 +26,11 @@ from .embedding import (
     make_adapter_embedding_wrapper,
     unwrap_adapter_embedding_wrapper,
 )
+from .model_compat import (
+    ANIMA_29B_BLOCK_MODE_AUTO,
+    ANIMA_29B_BLOCK_MODE_LEGACY_28,
+    resolve_anima_block_layout,
+)
 from .parsing import parse_anchor_seed_list
 from .patching import (
     extract_conditioning,
@@ -207,6 +212,10 @@ class AnimaArtistAdapterMixer:
                 "[AnimaAdapterMixer] unsupported "
                 f"anchor_keyframe_mode={anchor_keyframe_mode!r}"
             )
+        anima_29b_block_mode = str(advanced.get(
+            "anima_29b_block_mode",
+            ANIMA_29B_BLOCK_MODE_AUTO,
+        ))
 
         try:
             dm = model.get_model_object("diffusion_model")
@@ -218,13 +227,34 @@ class AnimaArtistAdapterMixer:
                 "preprocess_text_embeds Adapter interface."
             )
 
-        anchor_block_count = 0
+        anchor_model_block_count = 0
+        anchor_target_blocks = ()
+        anchor_layer_ordinals = {}
+        block_layout = None
         stabilizer_min_sigma = None
         if artist_anchor_q:
-            valid, anchor_block_count, _context_dim, message = validate_model(dm)
+            valid, anchor_model_block_count, _context_dim, message = validate_model(dm)
             if not valid:
                 raise ValueError(
                     f"[AnimaAdapterMixer] Q-only Anchor is unsupported: {message}"
+                )
+            block_layout = resolve_anima_block_layout(
+                anchor_model_block_count,
+                anima_29b_block_mode,
+            )
+            anchor_target_blocks = block_layout.physical_blocks
+            anchor_layer_ordinals = block_layout.logical_index_by_physical
+            if block_layout.resolved_mode == ANIMA_29B_BLOCK_MODE_LEGACY_28:
+                logger.info(
+                    "[AnimaAdapterAnchorQ] Anima-2.9B block mode=%s: "
+                    "%d/%d physical blocks are active; inserted blocks remain "
+                    "untouched: %s",
+                    block_layout.resolved_mode,
+                    len(anchor_target_blocks),
+                    anchor_model_block_count,
+                    ",".join(
+                        str(i) for i in block_layout.skipped_physical_blocks
+                    ),
                 )
             if stabilizer_end_percent < 1.0:
                 try:
@@ -320,6 +350,12 @@ class AnimaArtistAdapterMixer:
             normalize_weights,
             alignment_mode,
         )
+        if block_layout is not None:
+            cache_namespace = (
+                cache_namespace,
+                block_layout.resolved_mode,
+                anchor_target_blocks,
+            )
         state = {
             "enabled": True,
             "dm_ref": dm,
@@ -342,6 +378,10 @@ class AnimaArtistAdapterMixer:
             "anchor_seeds_count": anchor_seeds_count,
             "anchor_user_blend": anchor_user_blend,
             "anchor_deep_layer_threshold": anchor_deep_layer_threshold,
+            "anchor_layer_ordinals": anchor_layer_ordinals,
+            "anima_29b_block_mode": (
+                block_layout.resolved_mode if block_layout is not None else "native"
+            ),
             "anchor_refresh_mode": anchor_refresh_mode,
             "anchor_cache_points": anchor_cache_points,
             "anchor_keyframe_mode": anchor_keyframe_mode,
@@ -404,7 +444,7 @@ class AnimaArtistAdapterMixer:
         select_active_adapter_mixer(m, state)
 
         if artist_anchor_q:
-            for layer_index in range(anchor_block_count):
+            for layer_index in anchor_target_blocks:
                 cross_attn = dm.blocks[layer_index].cross_attn
                 original_forward = unwrap_cross_attn_forward(
                     unwrap_cross_attn(cross_attn)
@@ -418,10 +458,11 @@ class AnimaArtistAdapterMixer:
                     ),
                 )
             logger.info(
-                "[AnimaAdapterAnchorQ] Q-only Anchor is active on %d layers; "
+                "[AnimaAdapterAnchorQ] Q-only Anchor is active on %d/%d layers; "
                 "seeds=%s, user blend=%.2f, deep threshold=%d, "
                 "refresh=%s, cache points=%d, keyframes=%s.",
-                anchor_block_count,
+                len(anchor_target_blocks),
+                anchor_model_block_count,
                 ",".join(str(seed) for seed in anchor_seed_list),
                 anchor_user_blend,
                 anchor_deep_layer_threshold,

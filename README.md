@@ -74,6 +74,17 @@ before the diffusion model is constructed. This allows the mixer to work with
 both the original Anima checkpoints and the 2.9B expanded checkpoint without
 requiring a second loader-patch custom node.
 
+The Options node also exposes `anima_29b_block_mode`:
+
+- `auto` (default) resolves to `legacy_28` on a 40-block checkpoint. It maps
+  selectors from the original logical `0..27` layout and leaves the 12 inserted
+  2.9B blocks untouched by the mixer.
+- `legacy_28` explicitly requests the same 2B-aligned behavior.
+- `native_40` is an opt-in mode that addresses all physical `0..39` blocks.
+
+Other Anima checkpoint sizes remain identity-mapped. In the default 2.9B mode,
+block selectors and Anchor deep-layer thresholds use logical `0..27` indices.
+
 If `ComfyUI-Anima-2.9B` is also installed, its equivalent loader hook is safe to
 keep enabled; the hooks are idempotent and both use the checkpoint's real block
 count.
