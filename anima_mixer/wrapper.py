@@ -465,7 +465,11 @@ class CrossAttnWrapper(nn.Module):
             return x
 
         threshold = int(st.get("anchor_deep_layer_threshold", ANCHOR_LAYER_THRESHOLD_DISABLED))
-        if threshold >= 0 and self._idx >= threshold:
+        layer_ordinal = st.get("anchor_layer_ordinals", {}).get(
+            self._idx,
+            self._idx,
+        )
+        if threshold >= 0 and layer_ordinal >= threshold:
             return x
 
         anchor_x = st.get("_anchor_cache", {}).get(self._idx)

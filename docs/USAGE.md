@@ -46,7 +46,13 @@ Prompt
   → consumed as K/V by every DiT block's cross-attention
 ```
 
-The DiT backbone has 28 blocks total, each with its own independent cross-attention layer. The same text conditioning is consumed 28 times across these layers.
+The original Anima DiT backbone has 28 blocks, each with its own independent
+cross-attention layer. Anima-2.9B expands the same layout to 40 blocks. The
+plugin detects the checkpoint's actual count during ComfyUI model loading.
+With the default `anima_29b_block_mode=auto`, selectors use the original logical
+`0..27` positions and leave the 12 inserted blocks untouched by the mixer.
+`native_40` is an opt-in mode that directly addresses all physical `0..39`
+blocks.
 
 ### Injection mechanism
 
@@ -458,7 +464,9 @@ This keeps wlop dominant with a krenz accent, without breaking total-contributio
 DiT blocks at different depths correspond to different semantic levels: early blocks affect overall composition and style, later blocks affect detail and texture. For example:
 
 - `0..13` (front half): artist dominates composition; details are filled in by the model
-- `14..27` (back half): only inject into detail layers; composition follows the main prompt
+- `14..27` (back half): inject into the later aligned layers on a 28-block model
+  or Anima-2.9B in default `auto`/`legacy_28` mode. In `native_40`, use physical
+  `20..39` for an approximately equivalent range.
 
 ### `layer_filter` (more flexible layer selection)
 

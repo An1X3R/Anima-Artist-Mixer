@@ -31,7 +31,9 @@ from anima_mixer.embedding import (
     weighted_embedding_sum,
 )
 from anima_mixer.nodes_embedding import AnimaArtistAdapterMixer
+from anima_mixer.nodes_core import AnimaArtistCrossAttn
 from anima_mixer.nodes_ui import AnimaArtistOptions
+from anima_mixer.model_compat import ANIMA_2B_TO_29B_BLOCKS
 from anima_mixer.patching import (
     _make_mixer_cleanup_callback,
     _rebind_mixer_object_patches,
@@ -78,9 +80,9 @@ class FakeBlock:
 
 
 class FakeAnchorAdapterModel(FakeAdapterModel):
-    def __init__(self):
+    def __init__(self, block_count=1):
         super().__init__()
-        self.blocks = [FakeBlock()]
+        self.blocks = [FakeBlock() for _ in range(block_count)]
 
 
 class FakeModelPatcher:
@@ -276,6 +278,20 @@ class OptionNodeTests(unittest.TestCase):
             ("optional", "anchor_keyframe_mode"),
         ):
             self.assertIn("Adapter Mixer only", inputs[section][name][1]["tooltip"])
+
+    def test_new_nodes_default_to_auto_29b_block_layout(self):
+        inputs = AnimaArtistOptions.INPUT_TYPES()
+        mode = inputs["optional"]["anima_29b_block_mode"]
+
+        self.assertEqual(mode[1]["default"], "auto")
+        options, _ = AnimaArtistOptions().build(
+            start_block=0,
+            end_block=-1,
+            start_percent=0.0,
+            end_percent=1.0,
+            normalize_weights=True,
+        )
+        self.assertEqual(options["anima_29b_block_mode"], "auto")
 
 
 class AnchorKeyframeSelectionTests(unittest.TestCase):
@@ -1365,6 +1381,92 @@ class EmbeddingAdapterTests(unittest.TestCase):
         anchor_context = dm.blocks[0].cross_attn.calls[0]["context"]
         self.assertTrue(torch.equal(anchor_context[0], first_mixed_context[0]))
         self.assertFalse(torch.equal(anchor_context[0], base_context[0]))
+
+    def test_adapter_q_anchor_auto_mode_uses_legacy_29b_blocks(self):
+        dm = FakeAnchorAdapterModel(block_count=40)
+        model = FakeModelPatcher(dm)
+        artist_pack = {
+            "conditionings": [[[
+                torch.tensor([[[1.0, 2.0]]]),
+                {"t5xxl_ids": torch.tensor([20, 10, 11])},
+            ]]],
+            "labels": ["artist"],
+            "weights": [1.0],
+            "base_conditioning": [[
+                torch.tensor([[[0.0, 0.0]]]),
+                {"t5xxl_ids": torch.tensor([10, 11])},
+            ]],
+        }
+
+        patched_model, _ = AnimaArtistAdapterMixer().patch(
+            model,
+            artist_pack,
+            strength=1.0,
+            normalize_weights=True,
+            alignment_mode=ALIGN_BASE_ANCHORED,
+            enabled=True,
+            apply_to_uncond=False,
+            advanced_options={
+                "artist_anchor_q": True,
+                "anchor_seed_list": "42",
+                "anima_29b_block_mode": "auto",
+            },
+        )
+
+        patched_indices = sorted(
+            int(path.split(".")[2])
+            for path in patched_model.object_patches
+            if path.endswith(".cross_attn.forward")
+        )
+        self.assertEqual(patched_indices, list(ANIMA_2B_TO_29B_BLOCKS))
+        state = patched_model.object_patches[
+            "diffusion_model.blocks.29.cross_attn.forward"
+        ].state
+        self.assertEqual(state["anima_29b_block_mode"], "legacy_28")
+        self.assertEqual(state["anchor_layer_ordinals"][29], 20)
+
+    def test_cross_attn_auto_mode_uses_legacy_29b_blocks(self):
+        dm = FakeAnchorAdapterModel(block_count=40)
+        model = FakeModelPatcher(dm)
+        artist_pack = {
+            "conditionings": [[[
+                torch.tensor([[[1.0, 2.0]]]),
+                {"t5xxl_ids": torch.tensor([20, 10, 11])},
+            ]]],
+            "labels": ["artist"],
+            "weights": [1.0],
+            "base_conditioning": [[
+                torch.tensor([[[0.0, 0.0]]]),
+                {"t5xxl_ids": torch.tensor([10, 11])},
+            ]],
+        }
+
+        patched_model, _ = AnimaArtistCrossAttn().patch(
+            model,
+            artist_pack,
+            combine_mode="output_avg",
+            fusion_mode="interpolate",
+            strength=1.0,
+            enabled=True,
+            apply_to_uncond=False,
+            advanced_options={
+                "start_block": 0,
+                "end_block": 39,
+                "anima_29b_block_mode": "auto",
+            },
+        )
+
+        patched_indices = sorted(
+            int(path.split(".")[2])
+            for path in patched_model.object_patches
+            if path.endswith(".cross_attn.forward")
+        )
+        self.assertEqual(patched_indices, list(ANIMA_2B_TO_29B_BLOCKS))
+        state = patched_model.object_patches[
+            "diffusion_model.blocks.29.cross_attn.forward"
+        ]._anima_mixer_state
+        self.assertEqual(state["anima_29b_block_mode"], "legacy_28")
+        self.assertEqual(state["anchor_layer_ordinals"][29], 20)
 
     def test_adapter_warm_cache_reuses_sigma_trajectory_and_invalidates_context(self):
         dm = FakeAnchorAdapterModel()
