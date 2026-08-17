@@ -1,6 +1,7 @@
 """Core ComfyUI nodes: Pack and CrossAttn patcher."""
 
 import logging
+import secrets
 
 from .anchor import make_sigma_capture
 from .constants import (
@@ -24,9 +25,12 @@ from .parsing import (
     split_artist_chain,
 )
 from .patching import (
+    MixerFatalError,
     extract_conditioning,
+    format_tensor_diagnostic_snapshot,
     make_cross_attn_forward_patch,
     register_mixer_lifecycle,
+    tensor_diagnostic_snapshot,
     unwrap_cross_attn,
     unwrap_cross_attn_forward,
     validate_model,
@@ -34,6 +38,45 @@ from .patching import (
 from .wrapper import CrossAttnWrapper
 
 logger = logging.getLogger(__name__)
+
+
+def _capture_encoded_raw(conditioning, *, pack_id, role):
+    raw, _ids, _weights = extract_conditioning(conditioning)
+    snapshot = tensor_diagnostic_snapshot(raw)
+    if not snapshot.get("is_tensor", False):
+        message = (
+            f"[AnimaArtistPack] invalid tensor at stage=text_encode_raw "
+            f"role={role}; {format_tensor_diagnostic_snapshot(snapshot)}"
+        )
+        logger.error(message)
+        logger.error(
+            "[AnimaArtistPackDiag] pack=%s role=%s "
+            "provenance=invalid_at_encode snapshot={%s}",
+            pack_id,
+            role,
+            format_tensor_diagnostic_snapshot(snapshot),
+        )
+        raise MixerFatalError(message)
+    bad = snapshot.get("bad")
+    if bad is None or bad > 0:
+        provenance = (
+            "nonfinite_at_encode" if bad is not None else "health_unavailable"
+        )
+        message = (
+            f"[AnimaArtistPack] non-finite tensor at stage=text_encode_raw "
+            f"role={role}; {format_tensor_diagnostic_snapshot(snapshot)}"
+        )
+        logger.error(message)
+        logger.error(
+            "[AnimaArtistPackDiag] pack=%s role=%s provenance=%s "
+            "snapshot={%s}",
+            pack_id,
+            role,
+            provenance,
+            format_tensor_diagnostic_snapshot(snapshot),
+        )
+        raise MixerFatalError(message)
+    return snapshot
 
 
 class AnimaArtistPack:
@@ -71,6 +114,7 @@ class AnimaArtistPack:
     CATEGORY = "Anima/CrossAttn"
 
     def pack(self, clip, artist_chain, base_prompt=""):
+        pack_id = secrets.token_hex(8)
         parts = split_artist_chain(artist_chain)
         entries = parse_artist_entries(parts)
         names = [entry[0] for entry in entries]
@@ -93,6 +137,11 @@ class AnimaArtistPack:
             raise ValueError(
                 f"[AnimaArtistPack] failed to encode base_prompt (text={base!r}): {e}"
             )
+        base_snapshot = _capture_encoded_raw(
+            base_conditioning,
+            pack_id=pack_id,
+            role="base",
+        )
 
         if not names:
             return ({
@@ -102,6 +151,11 @@ class AnimaArtistPack:
                 "has_explicit_weights": False,
                 "base_prompt": base,
                 "base_conditioning": base_conditioning,
+                "_raw_encode_snapshots": {
+                    "pack_id": pack_id,
+                    "base": base_snapshot,
+                    "artists": [],
+                },
             },)
 
         if len(names) > MAX_ARTISTS:
@@ -115,7 +169,8 @@ class AnimaArtistPack:
             has_explicit = any(explicit_flags)
 
         conditionings = []
-        for name in names:
+        artist_snapshots = []
+        for index, name in enumerate(names):
             text = f"{name}\n{base}" if base else name
             try:
                 tokens = clip.tokenize(text)
@@ -125,6 +180,11 @@ class AnimaArtistPack:
                     f"[AnimaArtistPack] encoding failed (text={text!r}): {e}"
                 )
             conditionings.append(cond)
+            artist_snapshots.append(_capture_encoded_raw(
+                cond,
+                pack_id=pack_id,
+                role=f"artist[{index}]",
+            ))
 
         if has_explicit:
             logger.info(
@@ -139,6 +199,11 @@ class AnimaArtistPack:
             "has_explicit_weights": has_explicit,
             "base_prompt": base,
             "base_conditioning": base_conditioning,
+            "_raw_encode_snapshots": {
+                "pack_id": pack_id,
+                "base": base_snapshot,
+                "artists": artist_snapshots,
+            },
         },)
 
 

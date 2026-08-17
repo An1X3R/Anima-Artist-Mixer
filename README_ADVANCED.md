@@ -1,5 +1,8 @@
 # Anima-Artist-Mixer
 
+> [!CAUTION]
+> **Temporary diagnostic build (`26.8.4.dev1`), not a stable release.** It adds removable, observational probes for an intermittent conditioning/cache corruption bug and writes filtered logs to `E:\codex logs` by default. If Mixer protection or non-finite diagnostics trigger, [open a GitHub Issue](https://github.com/An1X3R/Anima-Artist-Mixer/issues) and attach the relevant `[Anima...]` log. Set `ANIMA_MIXER_SEMANTIC_DIAG=0` before launch to disable all temporary probes.
+
 ## Introduction
 
 This is a ComfyUI custom node that provides **multi-artist mixing** for the Anima model. It offers an established cross-attention output path and an experimental post-LLMAdapter embedding path, sidestepping the interference that LLM-based text encoders suffer from when multiple artist tags coexist in a single prompt.
@@ -42,7 +45,7 @@ Prompt
   → consumed as K/V by every DiT block's cross-attention
 ```
 
-The DiT backbone has 28 blocks total, each with its own independent cross-attention layer. The same text conditioning is consumed 28 times across these layers.
+The original Anima backbone has 28 DiT blocks, while Anima-2.9B has 40. The Mixer reads the block count from the loaded model at runtime and validates every block's cross-attention structure, so both layouts use the same node implementation without a version switch.
 
 ### Injection mechanism
 
@@ -146,6 +149,8 @@ Key points:
 | `base_prompt` | STRING (multiline, optional) | Main prompt. Leave empty to encode artists alone |
 
 Outputs `ANIMA_PACK`, an internal struct holding each artist's separately-encoded conditioning, the artist label list, the parsed per-artist weights, and a separately-encoded conditioning for the bare base prompt.
+
+The pack also records finite counts and compact value fingerprints for the base and every artist raw embedding. A non-finite text-encoder result aborts immediately. If a later Adapter failure occurs, the diagnostic compares encode-time, Mixer-state, and failure-time snapshots to distinguish encoder output failure from subsequent in-place conditioning corruption. It does not sanitize, retry, or replace invalid values.
 
 How it works internally: the node splits `artist_chain` into N artist names, parses any `::name::weight` syntax to extract per-artist injection weights (which are stripped before CLIP encoding), and encodes each as `<artist_name>\n<base_prompt>` (Anima's recommended format: artist first, newline, then main prompt). It also encodes a clean copy of `base_prompt` alone for use as KSampler's positive conditioning.
 
@@ -515,7 +520,7 @@ Artist batching is VRAM-aware. The plugin checks available VRAM once per samplin
 
 After connecting `AnimaArtistOptions`, you can **dramatically cut generation time** with usually minimal quality loss:
 
-- **Layer range** (`start_block / end_block` or `layer_filter`): inject only on specific DiT blocks. `0..13` (front half) cuts time roughly in half. Artist style is mostly determined by early blocks, so the loss is usually acceptable
+- **Layer range** (`start_block / end_block` or `layer_filter`): inject only on specific DiT blocks. For the 28-block model, `0..13` is the front half; for Anima-2.9B, use `0..19`. Artist style is mostly determined by early blocks, so limiting injection to the front half usually cuts this part of the cost substantially
 - **Sampling-step range** (`start_percent / end_percent`): inject only during a portion of sampling. `0.0..0.5` (first half) similarly cuts time, since artist style is mostly absorbed during early sampling
 
 Both can be **combined**: "front-half layers + front-half sampling" can bring 8-artist scenarios back to near-single-artist timing. This is the most effective optimization for multi-artist setups, and stacks with `artist_static_capture` / `artist_anchor_q`.
@@ -581,10 +586,10 @@ This keeps wlop dominant with a krenz accent, without breaking total-contributio
 
 ### Layer range (`start_block` / `end_block`)
 
-DiT blocks at different depths correspond to different semantic levels: early blocks affect overall composition and style, later blocks affect detail and texture. For example:
+DiT blocks at different depths correspond to different semantic levels: early blocks affect overall composition and style, later blocks affect detail and texture. The original Anima model has 28 blocks and Anima-2.9B has 40; the Mixer resolves the actual count at runtime. For example:
 
-- `0..13` (front half): artist dominates composition; details are filled in by the model
-- `14..27` (back half): only inject into detail layers; composition follows the main prompt
+- Original 28-block model: `0..13` (front half) or `14..27` (back half)
+- Anima-2.9B 40-block model: `0..19` (front half) or `20..39` (back half)
 
 ### `layer_filter` (more flexible layer selection)
 

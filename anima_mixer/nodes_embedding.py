@@ -27,17 +27,72 @@ from .embedding import (
     unwrap_adapter_embedding_wrapper,
 )
 from .parsing import parse_anchor_seed_list
+# TEMP_SEMANTIC_DIAG_HOOK: remove with semantic_diagnostics.py after diagnosis.
+from .semantic_diagnostics import (
+    initialize_state as initialize_semantic_diagnostics,
+    is_enabled as semantic_diagnostics_enabled,
+)
 from .patching import (
+    MixerFatalError,
+    classify_tensor_diagnostic_snapshot,
     extract_conditioning,
+    format_tensor_diagnostic_snapshot,
     register_mixer_lifecycle,
     select_active_adapter_mixer,
     tensor_cache_signature,
+    tensor_diagnostic_snapshot,
     unwrap_cross_attn,
     unwrap_cross_attn_forward,
     validate_model,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _encoded_raw_snapshot(artist_pack, index=None):
+    snapshots = artist_pack.get("_raw_encode_snapshots")
+    if not isinstance(snapshots, dict):
+        return None
+    if index is None:
+        return snapshots.get("base")
+    artists = snapshots.get("artists")
+    if not isinstance(artists, (list, tuple)) or index >= len(artists):
+        return None
+    return artists[index]
+
+
+def _capture_state_raw_snapshot(artist_pack, raw, *, role, index=None):
+    encode_snapshot = _encoded_raw_snapshot(artist_pack, index=index)
+    current_snapshot = tensor_diagnostic_snapshot(raw)
+    provenance = classify_tensor_diagnostic_snapshot(
+        encode_snapshot,
+        None,
+        current_snapshot,
+        boundary="before_state",
+    )
+    bad = current_snapshot.get("bad")
+    if bad is None or bad > 0 or not current_snapshot.get("is_tensor", False):
+        snapshots = artist_pack.get("_raw_encode_snapshots")
+        pack_id = (
+            snapshots.get("pack_id", "unavailable")
+            if isinstance(snapshots, dict) else "unavailable"
+        )
+        message = (
+            f"[AnimaAdapterMixer] invalid tensor at stage=state_creation_raw "
+            f"role={role}; {format_tensor_diagnostic_snapshot(current_snapshot)}"
+        )
+        logger.error(message)
+        logger.error(
+            "[AnimaAdapterMixerRawDiag] stage=state_creation_raw pack=%s "
+            "role=%s provenance=%s encode={%s} current={%s}",
+            pack_id,
+            role,
+            provenance,
+            format_tensor_diagnostic_snapshot(encode_snapshot),
+            format_tensor_diagnostic_snapshot(current_snapshot),
+        )
+        raise MixerFatalError(message)
+    return current_snapshot
 
 
 def _build_cache_namespace(
@@ -240,12 +295,21 @@ class AnimaArtistAdapterMixer:
                         error,
                     )
 
-        _base_raw, base_ids, base_t5_weights = extract_conditioning(base_conditioning)
+        base_raw, base_ids, base_t5_weights = extract_conditioning(base_conditioning)
+        if base_raw is None:
+            raise ValueError(
+                "[AnimaAdapterMixer] base conditioning is empty."
+            )
         if base_ids is None:
             raise ValueError(
                 "[AnimaAdapterMixer] token alignment requires Anima "
                 "t5xxl_ids in the base conditioning."
             )
+        base_state_snapshot = _capture_state_raw_snapshot(
+            artist_pack,
+            base_raw,
+            role="base",
+        )
 
         apply_to_uncond = bool(apply_to_uncond)
         if alignment_mode == ALIGN_BASE_ANCHORED and apply_to_uncond:
@@ -258,6 +322,7 @@ class AnimaArtistAdapterMixer:
 
         labels = artist_pack.get("labels") or []
         raws, ids_list, t5_weights_list = [], [], []
+        artist_state_snapshots = []
         for index, conditioning in enumerate(conditionings):
             raw, ids, t5_weights = extract_conditioning(conditioning)
             if raw is None:
@@ -268,6 +333,12 @@ class AnimaArtistAdapterMixer:
             raws.append(raw)
             ids_list.append(ids)
             t5_weights_list.append(t5_weights)
+            artist_state_snapshots.append(_capture_state_raw_snapshot(
+                artist_pack,
+                raw,
+                role=f"artist[{index}]",
+                index=index,
+            ))
 
         alignment_plan = None
         if alignment_mode == ALIGN_BASE_ANCHORED:
@@ -320,13 +391,45 @@ class AnimaArtistAdapterMixer:
             normalize_weights,
             alignment_mode,
         )
+        shared_model = getattr(m, "model", None)
+        try:
+            shared_abort_epoch = max(
+                0,
+                int(getattr(shared_model, "_anima_mixer_abort_epoch", 0)),
+            )
+            shared_recovered_epoch = max(
+                0,
+                int(getattr(
+                    shared_model,
+                    "_anima_mixer_recovered_abort_epoch",
+                    0,
+                )),
+            )
+        except Exception:
+            shared_abort_epoch = 0
+            shared_recovered_epoch = 0
         state = {
             "enabled": True,
             "dm_ref": dm,
+            "_shared_model_ref": shared_model,
+            # A newly created node state must still observe an unrecovered
+            # interrupt published by an older sibling ModelPatcher.  Once a
+            # shared recovery completed, beginning at that recovered epoch
+            # avoids repeating the one-shot warm-up for every prompt edit.
+            "_shared_abort_epoch_seen": min(
+                shared_abort_epoch,
+                shared_recovered_epoch,
+            ),
+            "_safe_adapter_refresh_pending": False,
+            "_safe_adapter_refresh_epoch": None,
             "labels": labels,
             "raws": raws,
             "ids_list": ids_list,
             "t5_weights_list": t5_weights_list,
+            "base_raw": base_raw,
+            "raw_encode_snapshots": artist_pack.get("_raw_encode_snapshots"),
+            "base_raw_state_snapshot": base_state_snapshot,
+            "artist_raw_state_snapshots": artist_state_snapshots,
             "base_ids": base_ids,
             "base_t5_weights": base_t5_weights,
             "user_weights": user_weights,
@@ -372,6 +475,40 @@ class AnimaArtistAdapterMixer:
             "_adapter_mixer_instance_token": secrets.token_hex(16),
             "_adapter_mixer_selected_for_run": None,
         }
+
+        # TEMP_SEMANTIC_DIAG_HOOK: exact, read-only input lineage at state creation.
+        if semantic_diagnostics_enabled():
+            raw_snapshots = artist_pack.get("_raw_encode_snapshots")
+            pack_id = (
+                raw_snapshots.get("pack_id")
+                if isinstance(raw_snapshots, dict)
+                else None
+            )
+            initialize_semantic_diagnostics(
+                state,
+                pack_id=pack_id,
+                base_prompt=artist_pack.get("base_prompt", ""),
+                labels=labels,
+                weights=user_weights,
+                normalize_weights=bool(normalize_weights),
+                alignment_mode=alignment_mode,
+                strength=strength,
+                apply_to_uncond=apply_to_uncond,
+                uncond_strength=state["uncond_strength"],
+                base_raw_snapshot=base_state_snapshot,
+                artist_raw_snapshots=artist_state_snapshots,
+                artist_ids_snapshots=tuple(
+                    tensor_diagnostic_snapshot(value)
+                    for value in ids_list
+                ),
+                artist_t5_weights_snapshots=tuple(
+                    tensor_diagnostic_snapshot(value)
+                    for value in t5_weights_list
+                ),
+                encoded_raw_snapshots=raw_snapshots,
+                base_ids_snapshot=tensor_diagnostic_snapshot(base_ids),
+                base_weights_snapshot=tensor_diagnostic_snapshot(base_t5_weights),
+            )
 
         existing_cross_attn = [
             str(path)

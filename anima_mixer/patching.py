@@ -1,14 +1,25 @@
 """Model validation, patch bookkeeping, conditioning, and CFG helpers."""
 
 import functools
+import hashlib
 import logging
 
 import torch
+
+# TEMP_SEMANTIC_DIAG_HOOK: remove with semantic_diagnostics.py after diagnosis.
+from .semantic_diagnostics import (
+    begin_run as begin_semantic_diagnostic_run,
+    end_run as end_semantic_diagnostic_run,
+    needs_run_start as needs_semantic_diagnostic_run_start,
+)
 
 logger = logging.getLogger(__name__)
 
 _MIXER_CALLBACK_KEY_PREFIX = "anima_artist_mixer_state_"
 _ACTIVE_ADAPTER_MIXER_TOKEN_KEY = "_anima_adapter_mixer_active_token"
+_SHARED_ABORT_EPOCH_ATTR = "_anima_mixer_abort_epoch"
+_SHARED_RECOVERED_ABORT_EPOCH_ATTR = "_anima_mixer_recovered_abort_epoch"
+_SHARED_WEIGHT_PATCH_HISTORY_ATTR = "_anima_mixer_weight_patch_history"
 
 
 class MixerFatalError(RuntimeError):
@@ -109,6 +120,150 @@ def tensor_cache_signature(tensor):
         tensor.device.index,
         version,
     )
+
+
+def tensor_diagnostic_snapshot(tensor):
+    """Capture exact value identity and finite counts at a diagnostic boundary."""
+    if not torch.is_tensor(tensor):
+        return {
+            "is_tensor": False,
+            "type": type(tensor).__name__,
+            "bad": None,
+            "nan": None,
+            "inf": None,
+            "fingerprint": None,
+        }
+
+    try:
+        version = int(tensor._version)
+    except Exception:
+        version = None
+    snapshot = {
+        "is_tensor": True,
+        "object_id": f"{id(tensor):x}",
+        "shape": tuple(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "device": str(tensor.device),
+        "version": version,
+        "bad": None,
+        "nan": None,
+        "inf": None,
+        "fingerprint": None,
+    }
+    try:
+        finite = torch.isfinite(tensor)
+        snapshot["bad"] = int((~finite).sum().item())
+        snapshot["nan"] = int(torch.isnan(tensor).sum().item())
+        snapshot["inf"] = int(torch.isinf(tensor).sum().item())
+    except Exception as error:
+        snapshot["health_error"] = str(error)
+    try:
+        raw_bytes = (
+            tensor.detach()
+            .contiguous()
+            .reshape(-1)
+            .view(torch.uint8)
+            .cpu()
+            .numpy()
+            .tobytes()
+        )
+        snapshot["fingerprint"] = hashlib.blake2b(
+            raw_bytes,
+            digest_size=8,
+        ).hexdigest()
+    except Exception as error:
+        snapshot["fingerprint_error"] = str(error)
+    return snapshot
+
+
+def format_tensor_diagnostic_snapshot(snapshot):
+    if not isinstance(snapshot, dict):
+        return "unavailable"
+    if not snapshot.get("is_tensor", False):
+        return f"type={snapshot.get('type', 'unknown')}"
+    fields = (
+        ("object", snapshot.get("object_id")),
+        ("shape", snapshot.get("shape")),
+        ("dtype", snapshot.get("dtype")),
+        ("device", snapshot.get("device")),
+        ("version", snapshot.get("version")),
+        ("bad", snapshot.get("bad")),
+        ("nan", snapshot.get("nan")),
+        ("inf", snapshot.get("inf")),
+        ("fp", snapshot.get("fingerprint")),
+    )
+    return ",".join(f"{key}={value}" for key, value in fields)
+
+
+def tensor_diagnostic_values_match(left, right):
+    """Compare exact retained values without treating object replacement as drift."""
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    if not left.get("is_tensor", False) or not right.get("is_tensor", False):
+        return False
+    left_fingerprint = left.get("fingerprint")
+    right_fingerprint = right.get("fingerprint")
+    if left_fingerprint is None or right_fingerprint is None:
+        return False
+    return (
+        left.get("shape"),
+        left.get("dtype"),
+        left_fingerprint,
+    ) == (
+        right.get("shape"),
+        right.get("dtype"),
+        right_fingerprint,
+    )
+
+
+def classify_tensor_diagnostic_snapshot(
+    encode_snapshot,
+    state_snapshot,
+    current_snapshot,
+    *,
+    boundary,
+):
+    """Name when a retained raw tensor became invalid or changed value."""
+    current_bad = (
+        current_snapshot.get("bad")
+        if isinstance(current_snapshot, dict) else None
+    )
+    encode_bad = (
+        encode_snapshot.get("bad")
+        if isinstance(encode_snapshot, dict) else None
+    )
+    state_bad = (
+        state_snapshot.get("bad")
+        if isinstance(state_snapshot, dict) else None
+    )
+    if current_bad is None:
+        return "health_unavailable"
+    if current_bad > 0:
+        if encode_bad is not None and encode_bad > 0:
+            return "nonfinite_at_encode"
+        if boundary == "before_state":
+            return "became_nonfinite_before_state"
+        if state_bad is not None:
+            if state_bad == 0:
+                return "became_nonfinite_after_state"
+            return "became_nonfinite_before_state"
+        if encode_bad == 0:
+            return "became_nonfinite_after_encode"
+        return "nonfinite_snapshot_unavailable"
+
+    if encode_bad is not None and encode_bad > 0:
+        return "nonfinite_at_encode_now_finite"
+    reference = (
+        state_snapshot
+        if boundary == "after_state" and isinstance(state_snapshot, dict)
+        else encode_snapshot
+    )
+    if not isinstance(reference, dict):
+        return "finite_snapshot_unavailable"
+    suffix = "after_state" if boundary == "after_state" else "before_state"
+    if tensor_diagnostic_values_match(reference, current_snapshot):
+        return f"finite_unchanged_{suffix}"
+    return f"finite_changed_{suffix}"
 
 
 def tensor_value_signature(tensor):
@@ -212,6 +367,29 @@ def runtime_input_signature(state):
     return signature
 
 
+# TEMP_SEMANTIC_DIAG_HOOK: capture exact values only at an execution boundary.
+def _semantic_diagnostic_inputs(state):
+    return {
+        "base_raw": tensor_diagnostic_snapshot(state.get("base_raw")),
+        "artist_raws": tuple(
+            tensor_diagnostic_snapshot(value)
+            for value in (state.get("raws") or [])
+        ),
+        "artist_ids": tuple(
+            tensor_diagnostic_snapshot(value)
+            for value in (state.get("ids_list") or [])
+        ),
+        "artist_t5_weights": tuple(
+            tensor_diagnostic_snapshot(value)
+            for value in (state.get("t5_weights_list") or [])
+        ),
+        "base_ids": tensor_diagnostic_snapshot(state.get("base_ids")),
+        "base_weights": tensor_diagnostic_snapshot(
+            state.get("base_t5_weights")
+        ),
+    }
+
+
 def forward_fingerprint(state, context):
     if context is None:
         return None
@@ -280,6 +458,106 @@ def _model_owner_token(apply_model, owner=None):
     return None
 
 
+def _shared_model_for_mixer(state, apply_model=None, patcher=None):
+    """Resolve the BaseModel shared by ModelPatcher clones.
+
+    Adapter Mixer state is clone-local, while ComfyUI intentionally keeps the
+    underlying BaseModel shared.  Interrupt recovery therefore needs one small
+    generation counter on that shared object, not only flags in the wrapper
+    closure that happened to observe the exception.
+    """
+    if patcher is not None:
+        model = getattr(patcher, "model", None)
+        if model is not None:
+            return model
+    model = getattr(apply_model, "__self__", None)
+    if model is not None:
+        return model
+    return state.get("_shared_model_ref")
+
+
+def _shared_epoch(model, attribute):
+    if model is None:
+        return 0
+    try:
+        return max(0, int(getattr(model, attribute, 0)))
+    except Exception:
+        return 0
+
+
+def _publish_shared_abort_epoch(state):
+    """Publish one Adapter interrupt to every state sharing this BaseModel."""
+    if state.get("_adapter_mixer_instance_token") is None:
+        # The original Cross-Attn Mixer also uses clear_mixer_run_state().  Its
+        # math does not perform the extra Adapter forward and must not opt into
+        # this Adapter-only recovery protocol.
+        return None
+    model = _shared_model_for_mixer(state)
+    if model is None:
+        return None
+    epoch = _shared_epoch(model, _SHARED_ABORT_EPOCH_ATTR) + 1
+    try:
+        setattr(model, _SHARED_ABORT_EPOCH_ATTR, epoch)
+        state["_shared_model_ref"] = model
+        state["_safe_adapter_refresh_pending"] = True
+        state["_safe_adapter_refresh_epoch"] = epoch
+        logger.warning(
+            "[AnimaAdapterMixer] fatal/interrupt boundary published shared "
+            "abort epoch=%d; the next Adapter cache miss will use a one-shot "
+            "safe refresh.",
+            epoch,
+        )
+        return epoch
+    except Exception:
+        logger.debug(
+            "[AnimaAdapterMixer] failed to publish the shared interrupt epoch.",
+            exc_info=True,
+        )
+        return None
+
+
+def pending_adapter_refresh_epoch(state):
+    """Return the shared abort epoch requiring one safe Adapter refresh."""
+    if not state.get("_safe_adapter_refresh_pending", False):
+        return None
+    model = _shared_model_for_mixer(state)
+    target = max(
+        _shared_epoch(model, _SHARED_ABORT_EPOCH_ATTR),
+        int(state.get("_safe_adapter_refresh_epoch", 0) or 0),
+    )
+    recovered = _shared_epoch(model, _SHARED_RECOVERED_ABORT_EPOCH_ATTR)
+    if target <= recovered:
+        state["_safe_adapter_refresh_pending"] = False
+        state["_safe_adapter_refresh_epoch"] = None
+        return None
+    return target
+
+
+def complete_adapter_refresh(state, epoch):
+    """Mark one successful post-interrupt Adapter refresh on the shared model."""
+    model = _shared_model_for_mixer(state)
+    epoch = max(0, int(epoch or 0))
+    if model is not None:
+        current_abort = _shared_epoch(model, _SHARED_ABORT_EPOCH_ATTR)
+        recovered = _shared_epoch(model, _SHARED_RECOVERED_ABORT_EPOCH_ATTR)
+        if epoch > recovered:
+            try:
+                setattr(model, _SHARED_RECOVERED_ABORT_EPOCH_ATTR, epoch)
+            except Exception:
+                logger.debug(
+                    "[AnimaAdapterMixer] failed to record the recovered abort epoch.",
+                    exc_info=True,
+                )
+        if current_abort > epoch:
+            # A newer interrupt raced this refresh.  Do not claim that newer
+            # generation is clean; the following cache miss will refresh again.
+            state["_safe_adapter_refresh_pending"] = True
+            state["_safe_adapter_refresh_epoch"] = current_abort
+            return
+    state["_safe_adapter_refresh_pending"] = False
+    state["_safe_adapter_refresh_epoch"] = None
+
+
 def _clear_model_bound_mixer_state(state):
     """Discard values produced with another effective model clone."""
     state["_artist_embedding_cache"] = {}
@@ -307,7 +585,15 @@ def clear_mixer_run_state(state, *, interrupted=False):
     if interrupted and state.get("_interrupt_cleanup_complete", False):
         return
 
+    # TEMP_SEMANTIC_DIAG_HOOK: close the observational run before state reset.
+    end_semantic_diagnostic_run(
+        state,
+        outcome="aborted" if interrupted else "cleanup",
+    )
+
     previous_input_signature = state.get("_runtime_input_signature")
+    if interrupted:
+        _publish_shared_abort_epoch(state)
 
     # Reuse the canonical run-state reset so newly added per-run fields do not
     # accidentally survive an interrupt boundary.
@@ -501,6 +787,48 @@ def _format_weight_patch_identity(identity):
     )
 
 
+def _record_shared_weight_patch_identity(state):
+    """Keep a short distinct LoRA/weight transition history on BaseModel."""
+    if state.get("_adapter_mixer_instance_token") is None:
+        return
+    identity = state.get("_model_weight_patch_identity")
+    if identity is None:
+        return
+    model = _shared_model_for_mixer(state)
+    history = []
+    if model is not None:
+        try:
+            history = list(getattr(
+                model,
+                _SHARED_WEIGHT_PATCH_HISTORY_ATTR,
+                (),
+            ))
+        except Exception:
+            history = []
+    changed = not history or history[-1] != identity
+    if changed:
+        history.append(identity)
+        history = history[-8:]
+        if model is not None:
+            try:
+                setattr(model, _SHARED_WEIGHT_PATCH_HISTORY_ATTR, tuple(history))
+            except Exception:
+                logger.debug(
+                    "[AnimaAdapterMixer] failed to record shared weight-patch history.",
+                    exc_info=True,
+                )
+    previous_distinct = history[-2] if len(history) > 1 else None
+    state["_shared_previous_weight_patch_identity"] = previous_distinct
+    state["_shared_weight_patch_history"] = tuple(history)
+    if changed and previous_distinct is not None:
+        logger.info(
+            "[AnimaAdapterMixer] shared BaseModel weight-patch transition: "
+            "%s -> %s.",
+            _format_weight_patch_identity(previous_distinct),
+            _format_weight_patch_identity(identity),
+        )
+
+
 def diffusion_model_for_apply_model(apply_model, fallback=None):
     """Resolve the diffusion model for the currently executing clone."""
     return _diffusion_model_for_patcher(
@@ -670,6 +998,51 @@ def begin_mixer_execution(
         )
         shared_owner_token = owner_token_override is not None
         weight_identity = model_weight_patch_identity(active_patcher)
+    is_adapter_mixer = state.get("_adapter_mixer_instance_token") is not None
+    shared_model = None
+    abort_epoch_changed = False
+    if is_adapter_mixer:
+        shared_model = _shared_model_for_mixer(
+            state,
+            apply_model=apply_model,
+            patcher=active_patcher,
+        )
+        if shared_model is not None:
+            state["_shared_model_ref"] = shared_model
+        abort_epoch = _shared_epoch(shared_model, _SHARED_ABORT_EPOCH_ATTR)
+        seen_abort_epoch = max(
+            0,
+            int(state.get("_shared_abort_epoch_seen", 0) or 0),
+        )
+        abort_epoch_changed = abort_epoch > seen_abort_epoch
+        if abort_epoch_changed:
+            recovered_epoch = _shared_epoch(
+                shared_model,
+                _SHARED_RECOVERED_ABORT_EPOCH_ATTR,
+            )
+            _clear_model_bound_mixer_state(state)
+            state["_force_boundary_check"] = True
+            state["_shared_abort_epoch_seen"] = abort_epoch
+            state["_safe_adapter_refresh_pending"] = abort_epoch > recovered_epoch
+            state["_safe_adapter_refresh_epoch"] = (
+                abort_epoch if abort_epoch > recovered_epoch else None
+            )
+            if active_patcher is not None and not shared_owner_token:
+                state["dm_ref"] = _diffusion_model_for_patcher(
+                    active_patcher,
+                    state.get("dm_ref"),
+                )
+            logger.warning(
+                "[AnimaAdapterMixer] observed shared abort epoch=%d (previous=%d); "
+                "discarded clone-local artist, mixed-context, and Anchor state%s.",
+                abort_epoch,
+                seen_abort_epoch,
+                (
+                    " and scheduled a one-shot Adapter refresh"
+                    if abort_epoch > recovered_epoch
+                    else ""
+                ),
+            )
     previous_owner = state.get("_model_owner_token")
     owner_changed = owner_token is not None and previous_owner not in (None, owner_token)
     previous_weight_identity = state.get("_model_weight_patch_identity")
@@ -778,6 +1151,7 @@ def begin_mixer_execution(
             owner_changed
             or weight_changed
             or conditioning_changed
+            or abort_epoch_changed
             or not state.get("_run_active", False)
             or previous_sigma is None
             or (sigma is not None and sigma > float(previous_sigma) + 1e-3)
@@ -814,12 +1188,33 @@ def begin_mixer_execution(
     if state.get("_run_active", False) and not explicit_run_start:
         state["_run_call_count"] = int(state.get("_run_call_count", 0)) + 1
     state["_adapter_mixer_run_start"] = is_run_start
+
+    # TEMP_SEMANTIC_DIAG_HOOK: support both lifecycle and sigma-fallback paths.
+    if is_adapter_mixer and needs_semantic_diagnostic_run_start(
+        state,
+        state.get("_execution_index", 0),
+    ):
+        semantic_owner = active_patcher or state.get("_model_owner_ref")
+        begin_semantic_diagnostic_run(
+            state,
+            execution_index=state.get("_execution_index", 0),
+            patcher_id=None if semantic_owner is None else id(semantic_owner),
+            patch_identity=state.get("_model_weight_patch_identity"),
+            current_inputs=_semantic_diagnostic_inputs(state),
+        )
     return is_run_start, owner_changed
 
 
 def _clone_mixer_state_for_patcher(state, patcher):
     cloned = dict(state)
-    for key in ("labels", "raws", "ids_list", "t5_weights_list", "user_weights"):
+    for key in (
+        "labels",
+        "raws",
+        "ids_list",
+        "t5_weights_list",
+        "user_weights",
+        "artist_raw_state_snapshots",
+    ):
         value = cloned.get(key)
         if isinstance(value, list):
             cloned[key] = list(value)
@@ -827,6 +1222,7 @@ def _clone_mixer_state_for_patcher(state, patcher):
         patcher,
         cloned.get("dm_ref"),
     )
+    cloned["_shared_model_ref"] = getattr(patcher, "model", None)
     cloned["individuals"] = None
     cloned["real_lens"] = None
     _clear_model_bound_mixer_state(cloned)
@@ -1067,6 +1463,7 @@ def _make_mixer_pre_run_callback(state):
             explicit_run_start=True,
         )
         identity = state.get("_model_weight_patch_identity")
+        _record_shared_weight_patch_identity(state)
         logger.info(
             "[AnimaAdapterMixer] run=%d patcher=%x %s",
             int(state.get("_execution_index", 0)),
@@ -1200,13 +1597,39 @@ def validate_model(diffusion_model):
     blocks = diffusion_model.blocks
     if len(blocks) == 0:
         return False, 0, 0, ".blocks is empty"
-    b0 = blocks[0]
-    if not hasattr(b0, "cross_attn"):
-        return False, 0, 0, "blocks[0] has no cross_attn"
-    ca = unwrap_cross_attn(b0.cross_attn)
-    if not hasattr(ca, "context_dim"):
-        return False, 0, 0, "cross_attn has no context_dim"
-    return True, len(blocks), int(ca.context_dim), "ok"
+    context_dim = None
+    for index, block in enumerate(blocks):
+        if not hasattr(block, "cross_attn"):
+            return False, 0, 0, f"blocks[{index}] has no cross_attn"
+        cross_attn = unwrap_cross_attn(block.cross_attn)
+        if not hasattr(cross_attn, "context_dim"):
+            return (
+                False,
+                0,
+                0,
+                f"blocks[{index}].cross_attn has no context_dim",
+            )
+        try:
+            block_context_dim = int(cross_attn.context_dim)
+        except (TypeError, ValueError, OverflowError):
+            return (
+                False,
+                0,
+                0,
+                f"blocks[{index}].cross_attn has invalid context_dim "
+                f"{cross_attn.context_dim!r}",
+            )
+        if context_dim is None:
+            context_dim = block_context_dim
+        elif block_context_dim != context_dim:
+            return (
+                False,
+                0,
+                0,
+                f"blocks[{index}].cross_attn context_dim={block_context_dim} "
+                f"does not match blocks[0] context_dim={context_dim}",
+            )
+    return True, len(blocks), context_dim, "ok"
 
 
 def preprocess_one(dm, raw, ids, weights, target_device, target_dtype):
