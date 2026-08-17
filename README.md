@@ -1,5 +1,8 @@
 # Anima-Artist-Mixer
 
+> [!CAUTION]
+> **Temporary diagnostic build (`26.8.4.dev1`) for locating an intermittent conditioning/cache corruption bug. This is not a stable release.** The added probes are observational and write filtered diagnostic logs to `E:\codex logs` by default. If `[AnimaAdapterMixer]` protection, a non-finite error, or related `[AnimaSemanticDiag]` / `[AnimaConditionDiag]` output appears, please [contact the maintainer through GitHub Issues](https://github.com/An1X3R/Anima-Artist-Mixer/issues) and attach the relevant log. Set `ANIMA_MIXER_SEMANTIC_DIAG=0` before starting ComfyUI to disable all temporary probes.
+
 A ComfyUI custom node for **multi-artist mixing** on Anima models. It encodes each artist separately, then mixes either cross-attention outputs or post-adapter embeddings, avoiding the prompt-side artist interference caused by Anima's LLM text encoder.
 
 ## New in 26.8.3: Interrupt and cache-state cleanup

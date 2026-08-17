@@ -22,6 +22,8 @@ from anima_mixer.constants import (
     ANCHOR_CACHE_POINTS_DEFAULT,
     ANCHOR_CACHE_POINTS_MAX,
     ANCHOR_KEYFRAME_ADAPTIVE_Q,
+    COMBINE_OUTPUT_AVG,
+    FUSION_INTERPOLATE,
 )
 from anima_mixer.embedding import (
     build_artist_embedding_sum,
@@ -30,15 +32,19 @@ from anima_mixer.embedding import (
     pad_embeddings_to_longest,
     weighted_embedding_sum,
 )
+from anima_mixer.nodes_core import AnimaArtistCrossAttn, AnimaArtistPack
 from anima_mixer.nodes_embedding import AnimaArtistAdapterMixer
 from anima_mixer.nodes_ui import AnimaArtistOptions
 from anima_mixer.patching import (
+    MixerFatalError,
     _make_mixer_cleanup_callback,
+    _make_mixer_pre_run_callback,
     _rebind_mixer_object_patches,
     begin_mixer_execution,
     call_with_mixer_owner,
     clear_mixer_run_state,
     reset_run_state,
+    validate_model,
 )
 from anima_mixer.adapter_anchor import make_adapter_anchor_q_forward_patch
 
@@ -78,9 +84,43 @@ class FakeBlock:
 
 
 class FakeAnchorAdapterModel(FakeAdapterModel):
-    def __init__(self):
+    def __init__(self, block_count=1):
         super().__init__()
-        self.blocks = [FakeBlock()]
+        self.blocks = [FakeBlock() for _ in range(block_count)]
+
+
+class ModelValidationTests(unittest.TestCase):
+    def test_validate_model_accepts_supported_dynamic_block_counts(self):
+        for block_count in (28, 40):
+            with self.subTest(block_count=block_count):
+                valid, actual_count, context_dim, message = validate_model(
+                    FakeAnchorAdapterModel(block_count)
+                )
+
+                self.assertTrue(valid, message)
+                self.assertEqual(actual_count, block_count)
+                self.assertEqual(context_dim, 2)
+
+    def test_validate_model_rejects_missing_cross_attention_in_final_block(self):
+        model = type("FortyBlockAnima", (), {
+            "blocks": [FakeBlock() for _ in range(40)],
+        })()
+        del model.blocks[39].cross_attn
+
+        valid, _block_count, _context_dim, message = validate_model(model)
+
+        self.assertFalse(valid)
+        self.assertIn("blocks[39]", message)
+
+    def test_validate_model_rejects_inconsistent_context_dimension(self):
+        model = FakeAnchorAdapterModel(40)
+        model.blocks[39].cross_attn.context_dim = 4
+
+        valid, _block_count, _context_dim, message = validate_model(model)
+
+        self.assertFalse(valid)
+        self.assertIn("blocks[39]", message)
+        self.assertIn("does not match", message)
 
 
 class FakeModelPatcher:
@@ -143,6 +183,269 @@ class FakeModelPatcher:
     def cleanup(self):
         for callback in self.get_all_callbacks("on_cleanup"):
             callback(self)
+
+
+class FakePackClip:
+    def __init__(self, nonfinite_call=None):
+        self.nonfinite_call = nonfinite_call
+        self.encode_calls = 0
+
+    def tokenize(self, text):
+        return text
+
+    def encode_from_tokens_scheduled(self, text):
+        call_index = self.encode_calls
+        self.encode_calls += 1
+        is_artist = "\n" in text
+        ids = (
+            torch.tensor([100 + call_index, 10, 11], dtype=torch.int32)
+            if is_artist else
+            torch.tensor([10, 11], dtype=torch.int32)
+        )
+        raw = torch.full(
+            (1, int(ids.numel()), 2),
+            float(call_index + 1),
+            dtype=torch.float32,
+        )
+        if call_index == self.nonfinite_call:
+            raw.fill_(float("nan"))
+        return [[raw, {
+            "t5xxl_ids": ids,
+            "t5xxl_weights": torch.ones(ids.shape, dtype=torch.float32),
+        }]]
+
+
+class PackBoundaryDiagnosticTests(unittest.TestCase):
+    @staticmethod
+    def _pack(clip=None, artists="artist_a,artist_b"):
+        return AnimaArtistPack().pack(
+            clip or FakePackClip(),
+            artists,
+            base_prompt="base prompt",
+        )[0]
+
+    def test_pack_records_full_value_snapshots_for_base_and_artists(self):
+        pack = self._pack()
+
+        snapshots = pack["_raw_encode_snapshots"]
+        self.assertRegex(snapshots["pack_id"], r"^[0-9a-f]{16}$")
+        self.assertEqual(snapshots["base"]["bad"], 0)
+        self.assertRegex(snapshots["base"]["fingerprint"], r"^[0-9a-f]{16}$")
+        self.assertEqual(len(snapshots["artists"]), 2)
+        self.assertTrue(all(item["bad"] == 0 for item in snapshots["artists"]))
+
+    def test_pack_fails_immediately_when_text_encoder_returns_nonfinite_raw(self):
+        with self.assertLogs("anima_mixer.nodes_core", level="ERROR") as logs:
+            with self.assertRaisesRegex(MixerFatalError, "text_encode_raw"):
+                self._pack(FakePackClip(nonfinite_call=0))
+
+        diagnostic = "\n".join(logs.output)
+        self.assertIn("[AnimaArtistPackDiag]", diagnostic)
+        self.assertIn("role=base", diagnostic)
+        self.assertIn("provenance=nonfinite_at_encode", diagnostic)
+        self.assertIn("bad=4", diagnostic)
+
+    def test_adapter_state_detects_raw_that_changed_after_pack(self):
+        pack = self._pack(artists="artist_a")
+        pack["base_conditioning"][0][0].fill_(float("nan"))
+
+        with self.assertLogs("anima_mixer.nodes_embedding", level="ERROR") as logs:
+            with self.assertRaisesRegex(MixerFatalError, "state_creation_raw"):
+                AnimaArtistAdapterMixer().patch(
+                    FakeModelPatcher(FakeAdapterModel()),
+                    pack,
+                    strength=1.0,
+                    normalize_weights=True,
+                    alignment_mode=ALIGN_BASE_ANCHORED,
+                    enabled=True,
+                    apply_to_uncond=False,
+                    uncond_strength=0.0,
+                )
+
+        diagnostic = "\n".join(logs.output)
+        self.assertIn("[AnimaAdapterMixerRawDiag]", diagnostic)
+        self.assertIn("role=base", diagnostic)
+        self.assertIn("provenance=became_nonfinite_before_state", diagnostic)
+
+    def test_adapter_state_detects_artist_raw_that_changed_after_pack(self):
+        pack = self._pack(artists="artist_a")
+        pack["conditionings"][0][0][0].fill_(float("nan"))
+
+        with self.assertLogs("anima_mixer.nodes_embedding", level="ERROR") as logs:
+            with self.assertRaisesRegex(MixerFatalError, "state_creation_raw"):
+                AnimaArtistAdapterMixer().patch(
+                    FakeModelPatcher(FakeAdapterModel()),
+                    pack,
+                    strength=1.0,
+                    normalize_weights=True,
+                    alignment_mode=ALIGN_BASE_ANCHORED,
+                    enabled=True,
+                    apply_to_uncond=False,
+                    uncond_strength=0.0,
+                )
+
+        diagnostic = "\n".join(logs.output)
+        self.assertIn("role=artist[0]", diagnostic)
+        self.assertIn("provenance=became_nonfinite_before_state", diagnostic)
+
+    def test_wrapper_failure_distinguishes_unchanged_and_late_mutated_raws(self):
+        for mutate_after_state, expected in (
+            (False, "finite_unchanged_after_state"),
+            (True, "became_nonfinite_after_state"),
+        ):
+            with self.subTest(mutate_after_state=mutate_after_state):
+                pack = self._pack()
+                patched, _ = AnimaArtistAdapterMixer().patch(
+                    FakeModelPatcher(FakeAdapterModel()),
+                    pack,
+                    strength=1.0,
+                    normalize_weights=True,
+                    alignment_mode=ALIGN_BASE_ANCHORED,
+                    enabled=True,
+                    apply_to_uncond=False,
+                    uncond_strength=0.0,
+                )
+                wrapper = patched.model_options["model_function_wrapper"]
+                state = wrapper._anima_adapter_mixer_state
+                if mutate_after_state:
+                    state["base_raw"].fill_(float("nan"))
+
+                options = {
+                    "input": torch.zeros((1, 1)),
+                    "timestep": torch.ones((1,)),
+                    "c": {
+                        "c_crossattn": torch.full(
+                            (1, 2, 2),
+                            float("nan"),
+                        ),
+                        "transformer_options": {"cond_or_uncond": [0]},
+                    },
+                    "cond_or_uncond": [0],
+                }
+                with mock.patch(
+                    "anima_mixer.patching.torch.cuda.is_available",
+                    return_value=False,
+                ), self.assertLogs(
+                    "anima_mixer.embedding",
+                    level="ERROR",
+                ) as logs:
+                    with self.assertRaisesRegex(MixerFatalError, "base_context"):
+                        wrapper(
+                            lambda *_args, **_kwargs: torch.zeros((1, 1)),
+                            options,
+                        )
+
+                diagnostic = "\n".join(logs.output)
+                self.assertIn("[AnimaAdapterMixerRawDiag]", diagnostic)
+                self.assertIn(f"role=base provenance={expected}", diagnostic)
+                self.assertIn("role=artist[0]", diagnostic)
+                self.assertIn("role=artist[1]", diagnostic)
+
+
+class Anima29BCompatibilityTests(unittest.TestCase):
+    @staticmethod
+    def _artist_pack():
+        return {
+            "conditionings": [[[
+                torch.tensor([[[1.0, 2.0]]]),
+                {"t5xxl_ids": torch.tensor([20, 10, 11])},
+            ]]],
+            "labels": ["artist"],
+            "weights": [1.0],
+            "base_conditioning": [[
+                torch.tensor([[[0.0, 0.0]]]),
+                {"t5xxl_ids": torch.tensor([10, 11])},
+            ]],
+        }
+
+    def test_adapter_anchor_q_patches_and_rebinds_all_40_blocks(self):
+        model = FakeModelPatcher(FakeAnchorAdapterModel(40))
+        patched, _ = AnimaArtistAdapterMixer().patch(
+            model,
+            self._artist_pack(),
+            strength=1.0,
+            normalize_weights=True,
+            alignment_mode=ALIGN_BASE_ANCHORED,
+            enabled=True,
+            apply_to_uncond=False,
+            uncond_strength=0.0,
+            advanced_options={
+                "artist_anchor_q": True,
+                "anchor_seed_list": "42",
+                "anchor_seed_list_is_manual": True,
+            },
+        )
+
+        last_path = "diffusion_model.blocks.39.cross_attn.forward"
+        anchor_paths = {
+            path for path in patched.object_patches
+            if path.endswith(".cross_attn.forward")
+        }
+        self.assertEqual(len(anchor_paths), 40)
+        self.assertIn(last_path, anchor_paths)
+
+        cloned = patched.clone()
+        self.assertIn(last_path, cloned.object_patches)
+        self.assertIsNot(
+            cloned.object_patches[last_path].state,
+            patched.object_patches[last_path].state,
+        )
+        cloned.cleanup()
+        self.assertIn(last_path, cloned.object_patches)
+
+    def test_cross_attention_end_block_minus_one_uses_dynamic_final_block(self):
+        for block_count in (28, 40):
+            with self.subTest(block_count=block_count):
+                model = FakeModelPatcher(FakeAnchorAdapterModel(block_count))
+                patched, _ = AnimaArtistCrossAttn().patch(
+                    model,
+                    self._artist_pack(),
+                    combine_mode=COMBINE_OUTPUT_AVG,
+                    fusion_mode=FUSION_INTERPOLATE,
+                    strength=1.0,
+                    enabled=True,
+                    apply_to_uncond=False,
+                    uncond_strength=0.0,
+                    advanced_options={"start_block": 0, "end_block": -1},
+                )
+
+                final_path = (
+                    f"diffusion_model.blocks.{block_count - 1}.cross_attn.forward"
+                )
+                cross_attn_paths = {
+                    path for path in patched.object_patches
+                    if path.endswith(".cross_attn.forward")
+                }
+                self.assertEqual(len(cross_attn_paths), block_count)
+                self.assertIn(final_path, cross_attn_paths)
+
+                cloned = patched.clone()
+                self.assertIn(final_path, cloned.object_patches)
+                self.assertIsNot(
+                    cloned.object_patches[final_path]._anima_mixer_state,
+                    patched.object_patches[final_path]._anima_mixer_state,
+                )
+                cloned.cleanup()
+                self.assertIn(final_path, cloned.object_patches)
+
+    def test_cross_attention_layer_filter_minus_one_selects_block_39(self):
+        model = FakeModelPatcher(FakeAnchorAdapterModel(40))
+        patched, _ = AnimaArtistCrossAttn().patch(
+            model,
+            self._artist_pack(),
+            combine_mode=COMBINE_OUTPUT_AVG,
+            fusion_mode=FUSION_INTERPOLATE,
+            strength=1.0,
+            enabled=True,
+            apply_to_uncond=False,
+            uncond_strength=0.0,
+            advanced_options={"layer_filter": "-1"},
+        )
+
+        self.assertEqual(
+            set(patched.object_patches),
+            {"diffusion_model.blocks.39.cross_attn.forward"},
+        )
 
 
 def make_state(dm, alignment_mode=ALIGN_BASE_ANCHORED):
@@ -483,6 +786,96 @@ class EmbeddingAdapterTests(unittest.TestCase):
         self.assertEqual(state["_artist_embedding_cache"], {})
         self.assertFalse(state["_run_active"])
 
+    def test_nonfinite_base_context_logs_batch_token_layout_and_patch_history(self):
+        state = make_state(FakeAdapterModel(), ALIGN_SHARED_BASE_IDS)
+        state.update({
+            "_adapter_mixer_instance_token": "adapter",
+            "_model_weight_patch_identity": ("new", "new", 2),
+            "_shared_weight_patch_history": (
+                ("old", "old", 1),
+                ("new", "new", 2),
+            ),
+            "base_raw": torch.ones((1, 8, 16), dtype=torch.float32),
+        })
+        context = torch.zeros((2, 8, 4))
+        context[1, 2:5, :] = float("nan")
+        context[1, 6, 0] = float("nan")
+        wrapper = make_adapter_embedding_wrapper(state, None)
+
+        options = {
+            "input": torch.zeros((2, 1)),
+            "timestep": torch.ones((2,)),
+            "c": {
+                "c_crossattn": context,
+                "transformer_options": {"cond_or_uncond": [0, 1]},
+            },
+            "cond_or_uncond": [0, 1],
+        }
+        with mock.patch(
+            "anima_mixer.patching.torch.cuda.is_available",
+            return_value=False,
+        ), self.assertLogs("anima_mixer.embedding", level="ERROR") as logs:
+            with self.assertRaisesRegex(RuntimeError, "stage=base_context"):
+                wrapper(lambda *_args, **_kwargs: torch.zeros((2, 1)), options)
+
+        diagnostic = "\n".join(logs.output)
+        self.assertIn("[AnimaAdapterMixerDiag]", diagnostic)
+        self.assertIn("batch=1 marker=1", diagnostic)
+        self.assertIn("affected_tokens=2-4,6", diagnostic)
+        self.assertIn("full_tokens=2-4", diagnostic)
+        self.assertIn("partial_tokens=6", diagnostic)
+        self.assertIn("patch_history", diagnostic)
+        self.assertIn(
+            "base_raw=(shape=(1, 8, 16),dtype=torch.float32,device=cpu,bad=0)",
+            diagnostic,
+        )
+
+    def test_pre_run_records_shared_weight_patch_transition_history(self):
+        dm = FakeAdapterModel()
+
+        class SharedBaseModel:
+            def __init__(self):
+                self.diffusion_model = dm
+                self.current_weight_patches_uuid = "old"
+
+            def apply_model(self, *_args, **_kwargs):
+                return None
+
+        class Owner:
+            def __init__(self, model, identity):
+                self.model = model
+                self.patches_uuid = identity
+                self.patches = {"adapter.weight": []}
+                self.model_options = {
+                    "_anima_adapter_mixer_active_token": "adapter",
+                }
+
+            def get_model_object(self, name):
+                if name != "diffusion_model":
+                    raise KeyError(name)
+                return self.model.diffusion_model
+
+        shared = SharedBaseModel()
+        first_state = make_state(dm)
+        first_state["_adapter_mixer_instance_token"] = "adapter"
+        first = Owner(shared, "old")
+        _make_mixer_pre_run_callback(first_state)(first)
+
+        shared.current_weight_patches_uuid = "new"
+        second_state = make_state(dm)
+        second_state["_adapter_mixer_instance_token"] = "adapter"
+        second = Owner(shared, "new")
+        _make_mixer_pre_run_callback(second_state)(second)
+
+        self.assertEqual(
+            second_state["_shared_previous_weight_patch_identity"],
+            ("old", "old", 1),
+        )
+        self.assertEqual(
+            second_state["_shared_weight_patch_history"],
+            (("old", "old", 1), ("new", "new", 1)),
+        )
+
     def test_interrupt_in_begin_boundary_clears_mixer_state(self):
         dm = FakeAdapterModel()
         state = make_state(dm, ALIGN_BASE_ANCHORED)
@@ -647,6 +1040,261 @@ class EmbeddingAdapterTests(unittest.TestCase):
         self.assertNotEqual(first_signature, state["_runtime_input_signature"])
         self.assertFalse(torch.equal(first, second))
         self.assertEqual(len(dm.seen_ids), 4)
+
+    def test_interrupt_epoch_propagates_across_states_sharing_one_base_model(self):
+        first_dm = FakeAdapterModel()
+        rebound_dm = FakeAdapterModel()
+
+        class SharedBaseModel:
+            def __init__(self):
+                self.diffusion_model = first_dm
+                self.current_patcher = None
+                self.current_weight_patches_uuid = "same-lora"
+
+            def apply_model(self, *_args, **_kwargs):
+                return None
+
+        class Owner:
+            def __init__(self, model):
+                self.model = model
+                self.patches_uuid = "same-lora"
+                self.patches = {"adapter.weight": []}
+
+            def get_model_object(self, name):
+                if name != "diffusion_model":
+                    raise KeyError(name)
+                return self.model.diffusion_model
+
+        shared = SharedBaseModel()
+        owner_a = Owner(shared)
+        owner_b = Owner(shared)
+        state_a = make_state(first_dm)
+        state_b = make_state(first_dm)
+        for state in (state_a, state_b):
+            state["_adapter_mixer_instance_token"] = "adapter"
+            state["_artist_embedding_cache"] = {"stale": torch.ones(1)}
+            state["_mixed_context_cache"] = {"mixed": torch.ones(1)}
+            state["_anchor_cache"] = {0: torch.ones(1)}
+            state["_anchor_trajectory"] = {"ready": True, "frames": [torch.ones(1)]}
+
+        begin_mixer_execution(
+            state_a,
+            shared.apply_model,
+            None,
+            owner=owner_a,
+            explicit_run_start=True,
+        )
+        begin_mixer_execution(
+            state_b,
+            shared.apply_model,
+            None,
+            owner=owner_b,
+            explicit_run_start=True,
+        )
+        state_b["_artist_embedding_cache"] = {"stale": torch.ones(1)}
+        state_b["_mixed_context_cache"] = {"mixed": torch.ones(1)}
+        state_b["_anchor_cache"] = {0: torch.ones(1)}
+        state_b["_anchor_trajectory"] = {"ready": True, "frames": [torch.ones(1)]}
+
+        with mock.patch(
+            "anima_mixer.patching.torch.cuda.is_available",
+            return_value=False,
+        ):
+            clear_mixer_run_state(state_a, interrupted=True)
+
+        self.assertEqual(shared._anima_mixer_abort_epoch, 1)
+        self.assertNotEqual(
+            state_b.get("_shared_abort_epoch_seen"),
+            shared._anima_mixer_abort_epoch,
+        )
+
+        # A sibling clone can retain the same LoRA UUID while the shared model
+        # has moved to a freshly resolved diffusion-model runtime.
+        shared.diffusion_model = rebound_dm
+        begin_mixer_execution(
+            state_b,
+            shared.apply_model,
+            None,
+            owner=owner_b,
+            explicit_run_start=True,
+        )
+
+        self.assertEqual(state_b["_shared_abort_epoch_seen"], 1)
+        self.assertTrue(state_b["_safe_adapter_refresh_pending"])
+        self.assertEqual(state_b["_artist_embedding_cache"], {})
+        self.assertIsNone(state_b["_mixed_context_cache"])
+        self.assertEqual(state_b["_anchor_cache"], {})
+        self.assertIsNone(state_b["_anchor_trajectory"])
+        self.assertIs(state_b["dm_ref"], rebound_dm)
+
+    def test_post_interrupt_safe_adapter_refresh_is_one_shot(self):
+        dm = FakeAdapterModel()
+
+        class SharedBaseModel:
+            def __init__(self):
+                self.diffusion_model = dm
+                self.current_patcher = None
+                self.current_weight_patches_uuid = "same-lora"
+                self._anima_mixer_abort_epoch = 1
+                self._anima_mixer_recovered_abort_epoch = 0
+
+            def apply_model(self, *_args, **_kwargs):
+                return None
+
+        class Owner:
+            def __init__(self, model):
+                self.model = model
+                self.patches_uuid = "same-lora"
+                self.patches = {"adapter.weight": []}
+
+            def get_model_object(self, name):
+                if name != "diffusion_model":
+                    raise KeyError(name)
+                return self.model.diffusion_model
+
+        shared = SharedBaseModel()
+        owner = Owner(shared)
+        state = make_state(dm, ALIGN_SHARED_BASE_IDS)
+        state["_adapter_mixer_instance_token"] = "adapter"
+        ref_context = torch.zeros((1, 5, 2))
+
+        begin_mixer_execution(
+            state,
+            shared.apply_model,
+            None,
+            owner=owner,
+            explicit_run_start=True,
+        )
+        self.assertTrue(state["_safe_adapter_refresh_pending"])
+
+        with mock.patch(
+            "anima_mixer.embedding.torch.cuda.is_available",
+            return_value=True,
+        ), mock.patch(
+            "anima_mixer.embedding.torch.cuda.synchronize",
+        ) as synchronize:
+            first = build_artist_embedding_sum(state, ref_context)
+            second = build_artist_embedding_sum(state, ref_context)
+
+        # The first post-interrupt cache miss runs one throwaway Adapter pass,
+        # then the retained pass. Later cache hits do not repeat the refresh.
+        self.assertEqual(len(dm.seen_ids), 4)
+        self.assertIs(first, second)
+        self.assertEqual(synchronize.call_count, 3)
+        self.assertFalse(state["_safe_adapter_refresh_pending"])
+        self.assertEqual(shared._anima_mixer_recovered_abort_epoch, 1)
+
+    def test_post_interrupt_refresh_discards_finite_drifting_warmup(self):
+        class FiniteDriftAdapter(FakeAdapterModel):
+            def preprocess_text_embeds(self, raw, ids, t5xxl_weights=None):
+                output = super().preprocess_text_embeds(
+                    raw,
+                    ids,
+                    t5xxl_weights=t5xxl_weights,
+                )
+                # Two artists are evaluated per pass.  The first pass remains
+                # finite but is materially different from the retained pass.
+                if len(self.seen_ids) <= 2:
+                    output = output * 0.5
+                return output
+
+        dm = FiniteDriftAdapter()
+        shared = type("SharedBaseModel", (), {
+            "diffusion_model": dm,
+            "current_weight_patches_uuid": "same-lora",
+            "_anima_mixer_abort_epoch": 1,
+            "_anima_mixer_recovered_abort_epoch": 0,
+        })()
+
+        class Owner:
+            model = shared
+            patches_uuid = "same-lora"
+            patches = {"adapter.weight": []}
+
+            def get_model_object(self, name):
+                if name != "diffusion_model":
+                    raise KeyError(name)
+                return dm
+
+        state = make_state(dm, ALIGN_SHARED_BASE_IDS)
+        state["_adapter_mixer_instance_token"] = "adapter"
+        begin_mixer_execution(
+            state,
+            None,
+            None,
+            owner=Owner(),
+            explicit_run_start=True,
+        )
+
+        with self.assertLogs("anima_mixer.embedding", level="WARNING") as logs:
+            retained = build_artist_embedding_sum(
+                state,
+                torch.zeros((1, 5, 2)),
+            )
+
+        self.assertEqual(len(dm.seen_ids), 4)
+        self.assertTrue(any(
+            "finite Adapter drift detected" in message
+            for message in logs.output
+        ))
+        # The retained normalized artist rows are [2, 3], rather than the
+        # warm-up rows [1, 1.5].
+        expected = torch.tensor([[[2.0, 3.0]]]).expand_as(retained)
+        self.assertTrue(torch.allclose(retained, expected))
+
+    def test_recovered_shared_epoch_does_not_rewarm_every_new_state(self):
+        dm = FakeAdapterModel()
+        shared = type("SharedBaseModel", (), {
+            "diffusion_model": dm,
+            "current_weight_patches_uuid": "same-lora",
+            "_anima_mixer_abort_epoch": 3,
+            "_anima_mixer_recovered_abort_epoch": 3,
+        })()
+
+        class Owner:
+            model = shared
+            patches_uuid = "same-lora"
+            patches = {"adapter.weight": []}
+
+            def get_model_object(self, name):
+                if name != "diffusion_model":
+                    raise KeyError(name)
+                return dm
+
+        # A newly built Mixer state has no cache to preserve, but may start
+        # with an older local epoch. It must still clear stale state without
+        # paying the double Adapter pass after another sibling already recovered.
+        state = make_state(dm, ALIGN_SHARED_BASE_IDS)
+        state.update({
+            "_adapter_mixer_instance_token": "adapter",
+            "_shared_abort_epoch_seen": 0,
+            "_artist_embedding_cache": {"stale": torch.ones(1)},
+        })
+        begin_mixer_execution(
+            state,
+            None,
+            None,
+            owner=Owner(),
+            explicit_run_start=True,
+        )
+
+        self.assertFalse(state["_safe_adapter_refresh_pending"])
+        self.assertEqual(state["_artist_embedding_cache"], {})
+        build_artist_embedding_sum(state, torch.zeros((1, 3, 2)))
+        self.assertEqual(len(dm.seen_ids), 2)
+
+    def test_cross_attention_state_does_not_publish_adapter_abort_epoch(self):
+        shared = type("SharedBaseModel", (), {})()
+        state = make_state(FakeAdapterModel())
+        state["_shared_model_ref"] = shared
+
+        with mock.patch(
+            "anima_mixer.patching.torch.cuda.is_available",
+            return_value=False,
+        ):
+            clear_mixer_run_state(state, interrupted=True)
+
+        self.assertFalse(hasattr(shared, "_anima_mixer_abort_epoch"))
 
     def test_abort_then_replaced_prompt_tensors_rebuilds_alignment_at_same_sigma(self):
         dm = FakeAdapterModel()

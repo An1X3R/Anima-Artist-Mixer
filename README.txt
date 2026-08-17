@@ -1,3 +1,9 @@
+TEMPORARY DIAGNOSTIC BUILD 26.8.4.dev1 - NOT A STABLE RELEASE
+This build adds removable, observational probes for an intermittent conditioning/cache corruption bug.
+Filtered logs are written to E:\codex logs by default. If AnimaAdapterMixer protection or non-finite diagnostics trigger, contact the maintainer at:
+https://github.com/An1X3R/Anima-Artist-Mixer/issues
+Attach the relevant [Anima...] log. Set ANIMA_MIXER_SEMANTIC_DIAG=0 before starting ComfyUI to disable all temporary probes.
+
 This plugin solves the problem of Anima not handling artist chains well.
 This plugin provides the established Cross-Attn path plus an experimental post-adapter path.
 
