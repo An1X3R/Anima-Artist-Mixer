@@ -2,6 +2,19 @@
 
 A ComfyUI custom node for **multi-artist mixing** on Anima models. It encodes each artist separately, then mixes either cross-attention outputs or post-adapter embeddings, avoiding the prompt-side artist interference caused by Anima's LLM text encoder.
 
+## New in 26.10.10: Long-prompt Adapter Mixer fix
+
+Fixes a `base_anchored` Adapter Mixer failure when token-row alignment expands the common canvas beyond the current model context length. Previously, an uncond-only call or a mixed CFG batch could trigger the length guard and disable artist mixing for the rest of the sampling run, allowing generation to finish with reduced style influence. The boundary depends on T5 token counts and alignment rows, not a fixed prompt character count.
+
+- Uncond-only calls in this length-expansion case now keep their original context without building artist embeddings or disabling the Mixer.
+- Mixed CFG batches run as separate cond/uncond groups and restore the original output order. Negative-prompt context is not extended with attention-visible zero padding.
+- Batch-dependent conditioning, Control tensors, and CFG metadata follow the split; existing wrapper chains remain in place. Q-only Anchor runs for the cond group without negative calls resetting its cache.
+- `shared_base_ids`, successful non-expanding batches, node interfaces, and the mixing formula remain unchanged. The split adds a second downstream wrapper call only for previously unsupported mixed batches.
+
+Validation: 63 CPU tests pass, including length-boundary, CFG-order, Anchor-cache, and interrupt regressions. A comparison of 108 successful-path configurations against the previous implementation produced exactly equal CPU contexts and outputs. Initial real-workflow testing found no issues; this is not a guarantee of bitwise-identical GPU results across hardware or attention backends.
+
+Restart ComfyUI after updating to load the fix.
+
 ## New in 26.8.3: Interrupt and cache-state cleanup
 
 This maintenance release hardens Mixer state across interrupted sampling, model clones, dynamic VRAM/offload, LoRA changes, and multi-GPU wrapper paths. It clears stale GPU-side Mixer state at execution boundaries and treats interrupt control-flow correctly, while keeping the existing Cross-Attn and Adapter mixing interfaces and math unchanged.
