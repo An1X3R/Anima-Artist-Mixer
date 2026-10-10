@@ -1483,6 +1483,350 @@ class EmbeddingAdapterTests(unittest.TestCase):
         self.assertFalse(attention_patch.state["_anchor_trajectory"]["ready"])
 
 
+class EmbeddingLengthRegressionTests(unittest.TestCase):
+    def test_expanding_cfg_splits_conditions_and_restores_batch_order(self):
+        for markers in ([0, 1], [1, 0], [0, 1, 0], [1, 0, 1], [0, 0, 1]):
+            for context_key in ("c_crossattn", "context"):
+                with self.subTest(markers=markers, context_key=context_key):
+                    dm = FakeAdapterModel()
+                    state = make_state(dm)
+                    batch_size = len(markers) * 2
+                    base = torch.arange(batch_size * 8, dtype=torch.float32).reshape(
+                        batch_size, 4, 2,
+                    ) + 1.0
+                    user_x = torch.arange(batch_size * 2, dtype=torch.float32).reshape(
+                        batch_size, 2,
+                    )
+                    timestep = torch.ones(batch_size)
+                    extra = torch.arange(batch_size, dtype=torch.float32).reshape(-1, 1)
+                    singleton = torch.ones((1, 2))
+                    sigmas = torch.ones(2)
+                    sample_sigmas = torch.arange(batch_size, dtype=torch.float32)
+                    patches = {"test": [sample_sigmas]}
+                    uuids = [f"condition-{index}" for index in range(len(markers))]
+                    observed = []
+
+                    def apply_model(input_tensor, model_timestep, **c):
+                        return input_tensor + c["y"] + c[context_key].sum((1, 2))[:, None]
+
+                    def previous_wrapper(model_function, options):
+                        observed.append(options)
+                        return model_function(
+                            options["input"], options["timestep"], **options["c"],
+                        )
+
+                    wrapper = make_adapter_embedding_wrapper(state, previous_wrapper)
+                    options = {
+                        "input": user_x,
+                        "timestep": timestep,
+                        "cond_or_uncond": markers,
+                        "c": {
+                            context_key: base,
+                            "y": extra,
+                            "control": {"input": [extra, None], "output": (extra,)},
+                            "singleton": singleton,
+                            "scalar": torch.tensor(3.0),
+                            "transformer_options": {
+                                "cond_or_uncond": markers,
+                                "uuids": uuids,
+                                "sigmas": sigmas,
+                                "sample_sigmas": sample_sigmas,
+                                "patches": patches,
+                            },
+                        },
+                    }
+                    output = wrapper(apply_model, options)
+                    mask = [marker == 0 for marker in markers for _ in range(2)]
+                    artist_sum = build_artist_embedding_sum(state, base)
+                    expected_context = mix_projected_context(
+                        align_base_context(base, state["alignment_plan"]),
+                        artist_sum, [1.0] * batch_size, mask, fallback_base=base,
+                    )
+                    expected = user_x + extra
+                    for row, should_mix in enumerate(mask):
+                        context = expected_context[row] if should_mix else base[row]
+                        expected[row] += context.sum()
+                    self.assertTrue(torch.equal(output, expected))
+                    self.assertEqual(len(observed), 2)
+                    self.assertEqual(state["_run_call_count"], 1)
+                    self.assertEqual(state["_execution_index"], 1)
+                    self.assertFalse(state["_embedding_mixer_failed"])
+                    for group, should_mix in zip(observed, (True, False)):
+                        chunks = [
+                            index for index, marker in enumerate(markers)
+                            if (marker == 0) == should_mix
+                        ]
+                        rows = [row for chunk in chunks for row in (2 * chunk, 2 * chunk + 1)]
+                        group_c = group["c"]
+                        group_transformer = group_c["transformer_options"]
+                        self.assertTrue(torch.equal(group["input"], user_x[rows]))
+                        self.assertTrue(torch.equal(group["timestep"], timestep[rows]))
+                        self.assertTrue(torch.equal(group_c["y"], extra[rows]))
+                        self.assertTrue(torch.equal(group_c["control"]["input"][0], extra[rows]))
+                        self.assertTrue(torch.equal(group_c["control"]["output"][0], extra[rows]))
+                        self.assertIsNone(group_c["control"]["input"][1])
+                        self.assertIs(group_c["singleton"], singleton)
+                        self.assertEqual(group_c["scalar"].item(), 3.0)
+                        expected_markers = [markers[index] for index in chunks]
+                        self.assertEqual(group["cond_or_uncond"], expected_markers)
+                        self.assertEqual(group_transformer["cond_or_uncond"], expected_markers)
+                        self.assertEqual(group_transformer["uuids"], [uuids[index] for index in chunks])
+                        self.assertIs(group_transformer["sigmas"], sigmas)
+                        self.assertIs(group_transformer["sample_sigmas"], sample_sigmas)
+                        self.assertIs(group_transformer["patches"], patches)
+                        self.assertEqual(group_c[context_key].shape[1], 5 if should_mix else 4)
+                        if not should_mix:
+                            self.assertTrue(torch.equal(group_c[context_key], base[rows]))
+                    self.assertIs(options["c"][context_key], base)
+                    self.assertIs(options["c"]["transformer_options"]["cond_or_uncond"], markers)
+
+    def test_native_512_boundary_only_splits_expanding_batches(self):
+        for base_count in (504, 505, 506, 512, 525, 651, 1024):
+            with self.subTest(base_count=base_count):
+                dm = FakeAdapterModel()
+                state = make_state(dm)
+                state["base_ids"] = torch.arange(base_count) + 10
+                state["ids_list"] = [
+                    torch.cat((torch.arange(prefix) + 10000, state["base_ids"]))
+                    for prefix in (7, 5)
+                ]
+                state["alignment_plan"] = build_base_anchored_plan(
+                    state["base_ids"], state["ids_list"],
+                )
+                context_length = max(512, base_count)
+                base = torch.ones((2, context_length, 2))
+                observed = []
+
+                def apply_model(input_tensor, timestep, **c):
+                    observed.append(c["c_crossattn"])
+                    return input_tensor
+
+                wrapper = make_adapter_embedding_wrapper(state, None)
+                user_x = torch.arange(2, dtype=torch.float32).reshape(2, 1)
+                output = wrapper(apply_model, {
+                    "input": user_x,
+                    "timestep": torch.ones(2),
+                    "c": {"c_crossattn": base},
+                    "cond_or_uncond": [0, 1],
+                })
+                self.assertTrue(torch.equal(output, user_x))
+                self.assertFalse(state["_embedding_mixer_failed"])
+                expanding = base_count + 7 > context_length
+                self.assertEqual(len(observed), 2 if expanding else 1)
+                if expanding:
+                    self.assertEqual(observed[0].shape[1], base_count + 7)
+                    self.assertTrue(torch.equal(observed[1], base[1:]))
+                else:
+                    self.assertEqual(observed[0].shape[1], 512)
+                    self.assertTrue(torch.equal(observed[0][1], base[1]))
+
+    def test_long_positive_and_short_negative_calls_do_not_disable_mixer(self):
+        for negative_first in (True, False):
+            with self.subTest(negative_first=negative_first):
+                dm = FakeAdapterModel()
+                state = make_state(dm)
+                state["base_ids"] = torch.arange(525) + 10
+                state["ids_list"] = [
+                    torch.cat((torch.arange(prefix) + 10000, state["base_ids"]))
+                    for prefix in (7, 5)
+                ]
+                state["alignment_plan"] = build_base_anchored_plan(
+                    state["base_ids"], state["ids_list"],
+                )
+                observed = []
+
+                def apply_model(input_tensor, timestep, **c):
+                    observed.append(c["c_crossattn"])
+                    return input_tensor
+
+                wrapper = make_adapter_embedding_wrapper(state, None)
+                positive = torch.ones((1, 525, 2))
+                negative = torch.full((1, 512, 2), 7.0)
+                markers = [1, 0, 1, 0] if negative_first else [0, 1, 0, 1]
+                for marker in markers:
+                    source = negative if marker else positive
+                    before_builds = len(dm.seen_ids)
+                    user_x = torch.zeros((1, 1))
+                    output = wrapper(apply_model, {
+                        "input": user_x,
+                        "timestep": torch.ones(1),
+                        "c": {"c_crossattn": source},
+                        "cond_or_uncond": [marker],
+                    })
+                    self.assertIs(output, user_x)
+                    self.assertFalse(state["_embedding_mixer_failed"])
+                    if marker:
+                        self.assertIs(observed[-1], negative)
+                        self.assertEqual(len(dm.seen_ids), before_builds)
+                    else:
+                        self.assertEqual(observed[-1].shape[1], 532)
+                        self.assertFalse(torch.equal(observed[-1][:, :525], positive))
+                self.assertEqual(len(dm.seen_ids), 2)
+
+    def test_successful_paths_keep_exact_context_and_single_dispatch(self):
+        for mode in (ALIGN_BASE_ANCHORED, ALIGN_SHARED_BASE_IDS):
+            for markers in ([0, 1], [1, 0], [0], [1]):
+                with self.subTest(mode=mode, markers=markers):
+                    state = make_state(FakeAdapterModel(), mode)
+                    batch_size = len(markers)
+                    base = torch.arange(batch_size * 12, dtype=torch.float32).reshape(
+                        batch_size, 6, 2,
+                    ) + 1.0
+                    observed = []
+
+                    def apply_model(input_tensor, timestep, **c):
+                        observed.append(c["c_crossattn"])
+                        return input_tensor
+
+                    wrapper = make_adapter_embedding_wrapper(state, None)
+                    user_x = torch.ones((batch_size, 1))
+                    output = wrapper(apply_model, {
+                        "input": user_x,
+                        "timestep": torch.ones(batch_size),
+                        "c": {"c_crossattn": base},
+                        "cond_or_uncond": markers,
+                    })
+                    artist_sum = build_artist_embedding_sum(state, base)
+                    projection = (
+                        align_base_context(base, state["alignment_plan"])
+                        if mode == ALIGN_BASE_ANCHORED else base
+                    )
+                    expected = mix_projected_context(
+                        projection, artist_sum, [1.0] * batch_size,
+                        [marker == 0 for marker in markers], fallback_base=base,
+                    )
+                    self.assertIs(output, user_x)
+                    self.assertEqual(len(observed), 1)
+                    self.assertTrue(torch.equal(observed[0], expected))
+                    self.assertFalse(state["_embedding_mixer_failed"])
+
+    def test_shared_base_ids_uncond_padding_is_not_changed(self):
+        state = make_state(FakeAdapterModel(), ALIGN_SHARED_BASE_IDS)
+        state["base_ids"] = torch.arange(5)
+        source = torch.ones((1, 4, 2))
+        observed = []
+
+        def apply_model(input_tensor, timestep, **c):
+            observed.append(c["c_crossattn"])
+            return input_tensor
+
+        make_adapter_embedding_wrapper(state, None)(apply_model, {
+            "input": torch.zeros((1, 1)),
+            "timestep": torch.ones(1),
+            "c": {"c_crossattn": source},
+            "cond_or_uncond": [1],
+        })
+        self.assertEqual(observed[0].shape[1], 5)
+        self.assertTrue(torch.equal(observed[0][:, :4], source))
+        self.assertEqual(observed[0][:, 4:].count_nonzero().item(), 0)
+        self.assertFalse(state["_embedding_mixer_failed"])
+
+    def test_split_interrupt_clears_run_state(self):
+        state = make_state(FakeAdapterModel())
+        observed = []
+
+        def apply_model(input_tensor, timestep, **c):
+            observed.append(c)
+            if len(observed) == 2:
+                raise KeyboardInterrupt("split interrupted")
+            return input_tensor
+
+        wrapper = make_adapter_embedding_wrapper(state, None)
+        with self.assertRaisesRegex(KeyboardInterrupt, "split interrupted"):
+            wrapper(apply_model, {
+                "input": torch.zeros((2, 1)),
+                "timestep": torch.ones(2),
+                "c": {"c_crossattn": torch.ones((2, 4, 2))},
+                "cond_or_uncond": [0, 1],
+            })
+        self.assertFalse(state["_run_active"])
+        self.assertIsNone(state["_mixed_context_cache"])
+        self.assertEqual(state["_artist_embedding_cache"], {})
+
+    def test_split_anchor_reuse_and_warm_cache_ignore_negative_calls(self):
+        for refresh_mode in ("once", "warm_cache"):
+            for markers in ([0, 1], [1, 0], [0, 1, 0]):
+                with self.subTest(refresh_mode=refresh_mode, markers=markers):
+                    dm = FakeAnchorAdapterModel()
+                    state = make_state(dm)
+                    state.update({
+                        "artist_anchor_q": True,
+                        "anchor_seed_list": [42],
+                        "anchor_refresh_mode": refresh_mode,
+                        "anchor_cache_points": 3,
+                        "stabilizer_min_sigma": 0.0,
+                        "_identity_context_signature": True,
+                    })
+                    attention_patch = make_adapter_anchor_q_forward_patch(
+                        dm.blocks[0].cross_attn.forward, state, 0,
+                    )
+                    wrapper = make_adapter_embedding_wrapper(
+                        state, make_sigma_capture(state, None),
+                    )
+                    batch_size = len(markers)
+                    base = torch.ones((batch_size, 4, 2))
+                    anchor_calls = []
+
+                    def apply_model(input_tensor, timestep, **c):
+                        if state.get("_in_anchor_run", False):
+                            anchor_calls.append(c["c_crossattn"])
+                        return attention_patch(
+                            input_tensor, c["c_crossattn"],
+                            transformer_options=c.get("transformer_options"),
+                        )
+
+                    def run(sigma, value):
+                        user_x = torch.full((batch_size, 2, 2), float(value))
+                        output = wrapper(apply_model, {
+                            "input": user_x,
+                            "timestep": torch.full((batch_size,), sigma),
+                            "c": {
+                                "c_crossattn": base,
+                                "transformer_options": {"cond_or_uncond": markers},
+                            },
+                            "cond_or_uncond": markers,
+                        })
+                        for row, marker in enumerate(markers):
+                            if marker:
+                                self.assertTrue(torch.equal(output[row], user_x[row]))
+                            else:
+                                self.assertFalse(torch.equal(output[row], user_x[row]))
+                        trajectory = state.get("_anchor_trajectory")
+                        cache = state["_anchor_cache"]
+                        negative = base[:1]
+                        negative_x = torch.full((1, 2, 2), 99.0)
+                        negative_output = wrapper(apply_model, {
+                            "input": negative_x,
+                            "timestep": torch.tensor([sigma]),
+                            "c": {
+                                "c_crossattn": negative,
+                                "transformer_options": {"cond_or_uncond": [1]},
+                            },
+                            "cond_or_uncond": [1],
+                        })
+                        self.assertTrue(torch.equal(negative_output, negative_x))
+                        self.assertIs(state.get("_anchor_trajectory"), trajectory)
+                        self.assertIs(state["_anchor_cache"], cache)
+                        self.assertFalse(state["_embedding_mixer_failed"])
+                        return output
+
+                    first_outputs = [run(sigma, value) for sigma, value in (
+                        (1.0, 10.0), (0.5, 20.0), (0.1, 30.0),
+                    )]
+                    self.assertEqual(len(anchor_calls), 3 if refresh_mode == "warm_cache" else 1)
+                    if refresh_mode == "warm_cache":
+                        trajectory = state["_anchor_trajectory"]
+                        for sigma, value in ((1.0, 40.0), (0.5, 50.0), (0.1, 60.0)):
+                            output = run(sigma, value)
+                            for row, marker in enumerate(markers):
+                                if marker == 0:
+                                    self.assertTrue(torch.equal(output[row], first_outputs[0][row]))
+                        self.assertIs(state["_anchor_trajectory"], trajectory)
+                        self.assertTrue(trajectory["ready"])
+                        self.assertEqual(len(anchor_calls), 3)
+                        self.assertEqual(state["_execution_index"], 2)
+
+
 class MixerLifecycleRegressionTests(unittest.TestCase):
     def _artist_pack(self):
         return {

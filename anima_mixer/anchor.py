@@ -28,6 +28,7 @@ from .patching import (
     resolve_clone_local_mixer_wrapper,
     resolve_multigpu_worker_wrapper,
     should_reraise,
+    tensor_cache_signature,
 )
 
 logger = logging.getLogger(__name__)
@@ -74,6 +75,11 @@ def _context_signature(state, context):
                 "adapter_mixed",
                 entry.get("key"),
             )
+        if isinstance(entry, dict):
+            signature = tensor_cache_signature(context)
+            for rows, split_signature in entry.get("split_context_signatures", {}).items():
+                if split_signature == signature:
+                    return ("adapter_mixed", entry.get("key"), rows)
         return ("adapter_context", execution_tensor_signature(state, context))
     return context_fingerprint(context)
 
@@ -630,6 +636,7 @@ def make_sigma_capture(state, prev_wrapper):
 
         if (
             not is_multigpu
+            and not options.get("_anima_adapter_mixer_skip_anchor", False)
             and state.get("artist_anchor_q", False)
             and not state.get("_anchor_failed", False)
             and not state.get("_embedding_mixer_failed", False)
