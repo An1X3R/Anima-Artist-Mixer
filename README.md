@@ -10,10 +10,6 @@ Fixes `base_anchored` mixing when T5 token-row alignment expands the canvas beyo
 
 Validation: 27 CPU regression tests pass on this 26.8.2-based integration, including length boundaries, CFG ordering, conditioning/Control slicing, and Anchor cache reuse. The contributor reports successful real-workflow testing of the original PR; this integration has not undergone a new GPU image-generation test.
 
-### Intermittent black-image reports
-
-Based on the maintainer's multi-party verification, the reported intermittent black images are currently attributed to ComfyUI behavior combined with conditions specific to the maintainer's local environment; changing the ComfyUI version resolved the observed cases. They are not established as a general Mixer defect. The temporary diagnostic build is retired, and this long-prompt fix does not claim to fix those black-image reports.
-
 Restart ComfyUI after updating.
 
 ## New in 26.8.2: Automatic Adapter Anchor Seeds
