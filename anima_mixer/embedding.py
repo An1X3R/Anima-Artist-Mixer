@@ -10,19 +10,10 @@ from .constants import ALIGN_BASE_ANCHORED, ALIGN_SHARED_BASE_IDS
 from .math_utils import project_perpendicular
 from .parsing import normalize_weights
 from .patching import (
-    adapter_mixer_state_is_active,
-    begin_mixer_execution,
     broadcast_batch,
-    call_with_mixer_owner,
-    clear_mixer_run_state,
-    execution_tensor_signature,
-    MixerFatalError,
     preprocess_one,
-    resolve_clone_local_mixer_wrapper,
     resolve_mask,
     resolve_strengths,
-    resolve_multigpu_worker_wrapper,
-    runtime_input_signature,
     should_reraise,
     tensor_cache_signature,
 )
@@ -140,15 +131,10 @@ def mix_projected_context(base, artist_sum, strengths, mask, fallback_base=None)
     return torch.where(row_mask, mixed, fallback_base)
 
 
-def build_artist_embedding_sum(state, ref_context, dm=None):
+def build_artist_embedding_sum(state, ref_context):
     """Run artist prompts through the model adapter once and cache their sum."""
     alignment_mode = state["alignment_mode"]
-    dm = state["dm_ref"] if dm is None else dm
     cache_key = (
-        state.get("_cache_namespace"),
-        state.get("_model_weight_patch_identity"),
-        runtime_input_signature(state),
-        id(dm),
         ref_context.device.type,
         ref_context.device.index,
         str(ref_context.dtype),
@@ -159,6 +145,7 @@ def build_artist_embedding_sum(state, ref_context, dm=None):
     if cached is not None:
         return cached
 
+    dm = state["dm_ref"]
     embeddings = []
     labels = state.get("labels") or []
     for index, (raw, artist_ids, artist_weights) in enumerate(zip(
@@ -186,9 +173,8 @@ def build_artist_embedding_sum(state, ref_context, dm=None):
                 ref_context.device,
                 ref_context.dtype,
             )
-        except BaseException as error:
+        except Exception as error:
             if should_reraise(error):
-                clear_mixer_run_state(state, interrupted=True)
                 raise
             label = labels[index] if index < len(labels) else f"#{index}"
             raise ValueError(
@@ -207,37 +193,23 @@ def build_artist_embedding_sum(state, ref_context, dm=None):
         state["user_weights"],
         normalize=state.get("normalize_weights", True),
     ).detach()
-    # Dynamic-VRAM/quantized Adapter weights may run on auxiliary CUDA streams.
-    # Finish that one cached Adapter build before the main denoiser reuses or
-    # unloads the same weights.  This is once per cache miss, never per sigma.
-    if torch.cuda.is_available():
-        sync_device = ref_context.device if ref_context.device.type == "cuda" else None
-        torch.cuda.synchronize(sync_device)
     cache[cache_key] = artist_sum
     return artist_sum
 
 
-def _call_underlying(prev_wrapper, apply_model, options, state=None):
-    def _call():
-        if prev_wrapper is not None:
-            return prev_wrapper(apply_model, options)
-        return apply_model(
-            options["input"],
-            options["timestep"],
-            **options["c"],
-        )
-
-    if state is None:
-        return _call()
-    return call_with_mixer_owner(state, apply_model, _call)
+def _call_underlying(prev_wrapper, apply_model, options):
+    if prev_wrapper is not None:
+        return prev_wrapper(apply_model, options)
+    return apply_model(
+        options["input"],
+        options["timestep"],
+        **options["c"],
+    )
 
 
-def _mixed_context_cache_key(state, context, mask, strengths):
+def _mixed_context_cache_key(context, mask, strengths):
     return (
-        state.get("_cache_namespace"),
-        state.get("_model_weight_patch_identity"),
-        runtime_input_signature(state),
-        execution_tensor_signature(state, context),
+        tensor_cache_signature(context),
         tuple(bool(value) for value in mask),
         tuple(float(value) for value in strengths),
     )
@@ -257,59 +229,107 @@ def _cached_mixed_context(state, context, cache_key):
     return mixed
 
 
+def _slice_batch_condition(value, rows, batch_size):
+    if torch.is_tensor(value):
+        if value.dim() > 0 and value.shape[0] == batch_size:
+            if rows[-1] - rows[0] + 1 == len(rows):
+                return value[rows[0]:rows[-1] + 1]
+            return value[rows]
+        return value
+    if isinstance(value, dict):
+        return {
+            key: _slice_batch_condition(item, rows, batch_size)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _slice_batch_condition(item, rows, batch_size)
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _slice_batch_condition(item, rows, batch_size)
+            for item in value
+        )
+    return value
+
+
+def _call_split_cfg_context(
+    prev_wrapper, apply_model, options, state, context_key, mixed_context, mask, cou,
+):
+    batch_size = len(mask)
+    if options["input"].shape[0] != batch_size:
+        raise ValueError("base-anchored CFG input/context batch sizes differ")
+    if not cou or batch_size % len(cou):
+        raise ValueError("base-anchored CFG split requires valid condition markers")
+    chunk_size = batch_size // len(cou)
+    c = options["c"]
+    transformer_options = c.get("transformer_options") or {}
+    uuids = transformer_options.get("uuids")
+    if uuids is not None and len(uuids) != len(cou):
+        raise ValueError("base-anchored CFG UUID/condition counts differ")
+
+    split_options = []
+    split_context_signatures = {}
+    output_rows = []
+    for should_mix in (True, False):
+        chunks = [
+            index for index in range(len(cou))
+            if mask[index * chunk_size] == should_mix
+        ]
+        rows = [
+            row for chunk in chunks
+            for row in range(chunk * chunk_size, (chunk + 1) * chunk_size)
+        ]
+        output_rows.extend(rows)
+        markers = [cou[index] for index in chunks]
+        group_c = {
+            key: _slice_batch_condition(value, rows, batch_size)
+            for key, value in c.items() if key != "transformer_options"
+        }
+        group_transformer_options = dict(transformer_options)
+        group_transformer_options["cond_or_uncond"] = markers
+        if uuids is not None:
+            group_transformer_options["uuids"] = [uuids[index] for index in chunks]
+        group_c["transformer_options"] = group_transformer_options
+        if should_mix:
+            group_context = _slice_batch_condition(mixed_context, rows, batch_size)
+            group_c[context_key] = group_context
+            split_context_signatures[tuple(rows)] = tensor_cache_signature(group_context)
+        group_options = dict(options)
+        group_options["input"] = _slice_batch_condition(options["input"], rows, batch_size)
+        group_options["timestep"] = _slice_batch_condition(
+            options["timestep"], rows, batch_size,
+        )
+        group_options["c"] = group_c
+        group_options["cond_or_uncond"] = markers
+        group_options["_anima_adapter_mixer_skip_anchor"] = not should_mix
+        split_options.append(group_options)
+
+    entry = state.get("_mixed_context_cache")
+    if isinstance(entry, dict) and entry.get("mixed") is mixed_context:
+        entry["split_context_signatures"] = split_context_signatures
+    outputs = []
+    for group_options in split_options:
+        outputs.append(_call_underlying(
+            prev_wrapper, apply_model, group_options,
+        ))
+    output = torch.cat(outputs, dim=0)
+    if output_rows == list(range(batch_size)):
+        return output
+    original_order = [0] * batch_size
+    for position, row in enumerate(output_rows):
+        original_order[row] = position
+    return output[original_order]
+
+
 def make_adapter_embedding_wrapper(state, prev_wrapper):
     """Replace post-adapter context at the model boundary, preserving wrapper chains."""
-    def _wrapper_body(apply_model, options):
-        clone_wrapper = resolve_clone_local_mixer_wrapper(
-            apply_model,
-            wrapper,
-            state,
-        )
-        if clone_wrapper is not None:
-            return clone_wrapper(apply_model, options)
-        if not adapter_mixer_state_is_active(state, apply_model=apply_model):
-            return _call_underlying(prev_wrapper, apply_model, options, state)
-        raw_c = options.get("c") or {}
-        transformer_options = raw_c.get("transformer_options") or {}
-        is_multigpu = (
-            isinstance(transformer_options, dict)
-            and transformer_options.get("multigpu_thread_device") is not None
-        )
-        if is_multigpu:
-            worker_wrapper = resolve_multigpu_worker_wrapper(
-                apply_model,
-                options,
-                wrapper,
-            )
-            if worker_wrapper is not None:
-                # The multigpu sampler calls the main model-options wrapper for
-                # every clone.  Re-enter through the clone-local rebound
-                # wrapper so its dm_ref, caches, and failure flags belong to
-                # the worker model rather than the first GPU.
-                worker_options = dict(options)
-                worker_options["_anima_mixer_worker_dispatch"] = True
-                return worker_wrapper(apply_model, worker_options)
-        is_run_start, _owner_changed = begin_mixer_execution(
-            state,
-            apply_model,
-            options.get("timestep"),
-            owner_token_override=(
-                ("multigpu_wrapper", id(state)) if is_multigpu else None
-            ),
-        )
-        if is_multigpu:
-            # ComfyUI's multigpu sampler invokes the main model-options wrapper
-            # concurrently for every device.  Keep this wrapper's owner token
-            # stable and avoid sharing a live mixed-context entry across workers.
-            state["_multigpu_call"] = True
-        # Always hand the result to the optional sigma wrapper.  ``False`` is
-        # meaningful: it tells the Adapter path that begin() already ran for
-        # this call, preventing the sigma wrapper from running it a second time.
-        state["_adapter_mixer_run_start"] = bool(is_run_start)
+    def wrapper(apply_model, options):
         if state.get("_embedding_mixer_failed", False):
-            return _call_underlying(prev_wrapper, apply_model, options, state)
+            return _call_underlying(prev_wrapper, apply_model, options)
 
-        c = raw_c
+        c = options.get("c") or {}
         context_key = None
         for key in ("c_crossattn", "context"):
             if torch.is_tensor(c.get(key)):
@@ -322,7 +342,7 @@ def make_adapter_embedding_wrapper(state, prev_wrapper):
                     "the original model context is used."
                 )
                 state["_warned_no_context"] = True
-            return _call_underlying(prev_wrapper, apply_model, options, state)
+            return _call_underlying(prev_wrapper, apply_model, options)
 
         try:
             context = c[context_key]
@@ -338,6 +358,17 @@ def make_adapter_embedding_wrapper(state, prev_wrapper):
                 state.get("apply_to_uncond", False),
                 state,
             )
+            split_cfg = (
+                state["alignment_mode"] == ALIGN_BASE_ANCHORED
+                and state["alignment_plan"]["length"] > context.shape[1]
+                and not all(mask)
+            )
+            if split_cfg and not any(mask):
+                passthrough_options = dict(options)
+                passthrough_options["_anima_adapter_mixer_skip_anchor"] = True
+                return _call_underlying(
+                    prev_wrapper, apply_model, passthrough_options,
+                )
             strengths = resolve_strengths(
                 cou,
                 batch_size,
@@ -345,36 +376,14 @@ def make_adapter_embedding_wrapper(state, prev_wrapper):
                 state["strength"],
                 state.get("uncond_strength", 1.0),
             )
-            cache_key = _mixed_context_cache_key(state, context, mask, strengths)
-            mixed_context = (
-                None
-                if is_multigpu
-                else _cached_mixed_context(state, context, cache_key)
-            )
+            cache_key = _mixed_context_cache_key(context, mask, strengths)
+            mixed_context = _cached_mixed_context(state, context, cache_key)
             if mixed_context is None:
-                # ``begin_mixer_execution`` pins ``dm_ref`` to the selected
-                # clone. Resolving through BaseModel.current_patcher here would
-                # reintroduce the sibling-clone drift the lifecycle repair
-                # explicitly filters out.
-                active_dm = state.get("dm_ref")
-                artist_sum = call_with_mixer_owner(
-                    state,
-                    apply_model,
-                    build_artist_embedding_sum,
-                    state,
-                    context,
-                    dm=active_dm,
-                )
+                artist_sum = build_artist_embedding_sum(state, context)
                 projection_base = context
                 fallback_base = context
                 if state["alignment_mode"] == ALIGN_BASE_ANCHORED:
                     plan = state["alignment_plan"]
-                    if plan["length"] > context.shape[1] and not all(mask):
-                        raise ValueError(
-                            "base-anchored context exceeds the batched base length; "
-                            "unmodified CFG rows cannot be preserved without an "
-                            "attention mask"
-                        )
                     projection_base = align_base_context(context, plan)
                 mixed_context = mix_projected_context(
                     projection_base,
@@ -383,27 +392,25 @@ def make_adapter_embedding_wrapper(state, prev_wrapper):
                     mask,
                     fallback_base=fallback_base,
                 )
-                if not bool(torch.isfinite(mixed_context).all().item()):
-                    raise MixerFatalError(
-                        "[AnimaAdapterMixer] post-adapter mixed context contains "
-                        "non-finite values; aborting this sampling pass."
-                    )
-                if not is_multigpu:
-                    state["_mixed_context_cache"] = {
-                        "source": context,
-                        "key": cache_key,
-                        "mixed": mixed_context,
-                        "mixed_signature": tensor_cache_signature(mixed_context),
-                    }
+                state["_mixed_context_cache"] = {
+                    "source": context,
+                    "key": cache_key,
+                    "mixed": mixed_context,
+                    "mixed_signature": tensor_cache_signature(mixed_context),
+                }
 
+            if split_cfg:
+                return _call_split_cfg_context(
+                    prev_wrapper, apply_model, options, state,
+                    context_key, mixed_context, mask, cou,
+                )
             mixed_c = dict(c)
             mixed_c[context_key] = mixed_context
             mixed_options = dict(options)
             mixed_options["c"] = mixed_c
-            return _call_underlying(prev_wrapper, apply_model, mixed_options, state)
-        except BaseException as error:
+            return _call_underlying(prev_wrapper, apply_model, mixed_options)
+        except Exception as error:
             if should_reraise(error):
-                clear_mixer_run_state(state, interrupted=True)
                 raise
             if not state.get("_warned_embedding_failure", False):
                 logger.exception(
@@ -413,44 +420,6 @@ def make_adapter_embedding_wrapper(state, prev_wrapper):
                 )
                 state["_warned_embedding_failure"] = True
             state["_embedding_mixer_failed"] = True
-            return _call_underlying(prev_wrapper, apply_model, options, state)
+            return _call_underlying(prev_wrapper, apply_model, options)
 
-    def wrapper(apply_model, options):
-        # The sampler can raise InterruptProcessingException before the
-        # context branch, during clone-local/multi-GPU dispatch, or on the
-        # no-context fast path. Keep one abort-safe boundary around the whole
-        # wrapper so those paths release Mixer-owned state as well.
-        try:
-            return _wrapper_body(apply_model, options)
-        except BaseException as error:
-            if should_reraise(error):
-                clear_mixer_run_state(state, interrupted=True)
-            raise
-
-    wrapper._anima_adapter_mixer_wrapper = True
-    wrapper._anima_adapter_mixer_previous = prev_wrapper
-    wrapper._anima_adapter_mixer_state = state
-    wrapper._anima_mixer_state = state
-    wrapper._anima_mixer_previous = prev_wrapper
-    wrapper._anima_mixer_factory = make_adapter_embedding_wrapper
-    return wrapper
-
-
-def unwrap_adapter_embedding_wrapper(wrapper):
-    """Remove Adapter Mixer wrappers while preserving external wrappers."""
-    seen = set()
-    while (
-        getattr(wrapper, "_anima_adapter_mixer_wrapper", False)
-        or getattr(wrapper, "_anima_adapter_anchor_sigma_wrapper", False)
-    ):
-        if wrapper is None:
-            break
-        marker = id(wrapper)
-        if marker in seen:
-            break
-        seen.add(marker)
-        if getattr(wrapper, "_anima_adapter_mixer_wrapper", False):
-            wrapper = getattr(wrapper, "_anima_adapter_mixer_previous", None)
-        else:
-            wrapper = getattr(wrapper, "_anima_adapter_anchor_sigma_previous", None)
     return wrapper

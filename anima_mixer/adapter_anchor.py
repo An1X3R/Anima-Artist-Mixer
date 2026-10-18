@@ -5,12 +5,7 @@ import logging
 import torch
 
 from .constants import ANCHOR_LAYER_THRESHOLD_DISABLED
-from .patching import (
-    clear_mixer_run_state,
-    in_stabilizer_window,
-    resolve_mask,
-    should_reraise,
-)
+from .patching import in_stabilizer_window, resolve_mask, should_reraise
 
 logger = logging.getLogger(__name__)
 
@@ -33,13 +28,6 @@ def _match_anchor_batch(anchor_x, x):
 
 def resolve_adapter_anchor_input(x, state, layer_index, transformer_options):
     """Replace cond rows with fixed-anchor hidden states for one attention layer."""
-    if isinstance(transformer_options, dict) and transformer_options.get(
-        "multigpu_thread_device"
-    ) is not None:
-        # The multigpu sampler invokes one shared model-options wrapper from
-        # concurrent device workers.  A single mutable Anchor cache cannot be
-        # safely shared between those workers, so keep the user Q path intact.
-        return x
     if not state.get("artist_anchor_q", False):
         return x
     if state.get("_anchor_failed", False):
@@ -95,21 +83,6 @@ class AdapterAnchorQForwardPatch:
         self.original_forward = original_forward
         self.state = state
         self.layer_index = int(layer_index)
-        self._anima_mixer_state = state
-
-    def rebind_state(
-        self,
-        state,
-        original_forward=None,
-        original_module=None,
-    ):
-        """Create a clone-local patch with the clone's original forward."""
-        del original_module  # kept for a common object-patch rebind signature
-        return type(self)(
-            self.original_forward if original_forward is None else original_forward,
-            state,
-            self.layer_index,
-        )
 
     def __call__(self, x, context=None, rope_emb=None, transformer_options=None):
         if self.state.get("_in_anchor_run", False):
@@ -130,9 +103,8 @@ class AdapterAnchorQForwardPatch:
                 self.layer_index,
                 transformer_options,
             )
-        except BaseException as error:
+        except Exception as error:
             if should_reraise(error):
-                clear_mixer_run_state(self.state, interrupted=True)
                 raise
             if not self.state.get("_warned_adapter_anchor_failure", False):
                 logger.exception(

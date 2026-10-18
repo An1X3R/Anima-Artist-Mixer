@@ -2,20 +2,25 @@
 
 A ComfyUI custom node for **multi-artist mixing** on Anima models. It encodes each artist separately, then mixes either cross-attention outputs or post-adapter embeddings, avoiding the prompt-side artist interference caused by Anima's LLM text encoder.
 
-## New in 26.8.3: Interrupt and cache-state cleanup
+## New in 26.10.18: Long-prompt Adapter Mixer fix
 
-This maintenance release hardens Mixer state across interrupted sampling, model clones, dynamic VRAM/offload, LoRA changes, and multi-GPU wrapper paths. It clears stale GPU-side Mixer state at execution boundaries and treats interrupt control-flow correctly, while keeping the existing Cross-Attn and Adapter mixing interfaces and math unchanged.
+This release integrates [PR #14](https://github.com/An1X3R/Anima-Artist-Mixer/pull/14) on the **26.8.2** implementation, retaining automatic Adapter Anchor seeds. The later 26.8.3 interrupt/cache changes and temporary diagnostic probes are excluded.
 
-The black-image/noise failure addressed here was observed in testing with RTX 50-series hardware combined with dynamic VRAM/offload and interrupted sampling followed by LoRA changes. It may also be triggered on earlier GPU generations; the 50-series is only the environment where we confirmed it most clearly. Treat this as a compatibility note, not a hardware-specific guarantee.
+Fixes `base_anchored` mixing when T5 token-row alignment expands the canvas beyond the current context length. Mixed CFG batches run as separate positive/negative groups and restore the original output order; negative contexts retain their original length. Negative-only calls bypass artist embedding construction. Q-only Anchor remains limited to positive groups, with cache reuse preserved. The normal non-expanding path and mixing formula are unchanged.
+
+Validation: 27 CPU regression tests pass on this 26.8.2-based integration, including length boundaries, CFG ordering, conditioning/Control slicing, and Anchor cache reuse. The contributor reports successful real-workflow testing of the original PR; this integration has not undergone a new GPU image-generation test.
+
+### Intermittent black-image reports
+
+Based on the maintainer's multi-party verification, the reported intermittent black images are currently attributed to ComfyUI behavior combined with conditions specific to the maintainer's local environment; changing the ComfyUI version resolved the observed cases. They are not established as a general Mixer defect. The temporary diagnostic build is retired, and this long-prompt fix does not claim to fix those black-image reports.
+
+Restart ComfyUI after updating.
 
 ## New in 26.8.2: Automatic Adapter Anchor Seeds
 
 The Adapter Mixer's Q-only Anchor once again accepts an empty `anchor_seed_list`. In that mode, `anchor_seeds_count` generates fresh random anchor seeds on every execution so users can explore different style references. Entering one or more fixed seeds still provides repeatable cross-run stabilization and allows `once` or `warm_cache` data to be reused while the cache key remains unchanged.
 
 ## New in 26.8.1: Post-Adapter Artist Mixing
-
-### Special thanks [spawner]（ https://github.com/spawner1145 )
-The idea and formula of Post Adapter Artist Mixing were proposed by him
 
 `Anima Artist Adapter Mixer (Experimental)` is the headline addition in 26.8.1. It moves artist mixing to the post-LLMAdapter context and performs the projection once at the model boundary instead of running the established artist-output mix inside every patched cross-attention layer.
 
